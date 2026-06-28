@@ -37,17 +37,17 @@
               │                  │  HTTPRoutes          │
               │                  │  (strip /api prefix) │
               │  ns prod:        ▼                      │
-              │   /            → [frontend  :80]        │
+              │   /            → [frontend  :8080]      │
               │   /api/auth,users → [user-service :8000]│
               │   /api/trips,expenses → [travel-svc:8000]
               │   /api/ai      → [ai-service :8000]     │
               │   /api/weather,hotels… → [utility:8000] │
               │                  │            │         │
               │   [ai-service] ──┘  SQS send  │         │
-              │   [ai-worker] ◄ KEDA scales on queue    │
+              │   [ai-worker] ◄ HPA scales on CPU       │
               │                                        │
               │  Platform (GitOps-managed):            │
-              │   ArgoCD · KGateway · Karpenter · KEDA  │
+              │   ArgoCD · KGateway · Cluster Autoscaler│
               │   · metrics-server · kube-prometheus    │
               └───────┬───────────────────┬────────────┘
                       │                   │
@@ -71,11 +71,11 @@
 4. HTTPRoutes match by path prefix and apply a `URLRewrite` filter that **strips
    `/api`** before forwarding (e.g. `/api/users` → `/users`). Longest-prefix wins,
    so `/api/*` beats the frontend catch-all `/`.
-5. Request reaches the backend `Service` (`:8000` APIs, `:80` frontend) → Pod.
+5. Request reaches the backend `Service` (`:8000` APIs, `:8080` frontend) → Pod.
 6. Backend services read secrets from Secrets Manager at startup (via IRSA).
 7. `ai-service` calls the Bedrock Converse/InvokeModel API (Nova Pro) using its
    IRSA role; long-running generations are pushed to SQS and processed
-   asynchronously by `ai-worker` (scaled by KEDA on queue depth).
+   asynchronously by `ai-worker` (scaled by HPA on CPU utilization).
 
 > **Ingress note:** There is **no nginx-ingress and no ALB** in the live path.
 > The legacy Terraform ALB module is disabled (`enable_legacy_alb = false`).
@@ -160,37 +160,63 @@ in the same AZ. Database route tables have **no** `0.0.0.0/0` route (no internet
 |-----------|-------|
 | Cluster name | `ai-travel-prod` |
 | Kubernetes version | 1.30 |
-| OIDC provider | Enabled (required for IRSA and Karpenter) |
+| OIDC provider | Enabled (required for IRSA) |
 | Worker placement | Private subnets only |
 
-### Baseline Managed Node Group
+### Managed Node Group
 
 | Parameter | Value |
 |-----------|-------|
-| Instance type | t3.small |
-| Min / Desired / Max | 2 / 2 / 5 |
+| Instance type | t3.medium (2 vCPU, 4 GB RAM) |
+| Min / Desired / Max | 3 / 3 / 6 |
 | Disk | 50 GB EBS |
+| Capacity type | On-Demand |
+| Node scaling | Kubernetes Cluster Autoscaler |
 
-The managed node group is the **baseline** that runs cluster-critical add-ons
-(ArgoCD, KGateway, Karpenter itself, KEDA, metrics-server, monitoring). Dynamic
-application capacity is provided by **Karpenter**.
+The managed node group runs all cluster workloads — both platform components
+(ArgoCD, KGateway, metrics-server, monitoring) and application pods. The
+**Cluster Autoscaler** automatically adjusts the node count between 3 and 6
+based on pending pod scheduling pressure.
 
-### Karpenter NodePool (`PlanMyJourney-Gitops/platform/karpenter`)
+The node group ASG is tagged for auto-discovery:
+- `k8s.io/cluster-autoscaler/enabled: "true"`
+- `k8s.io/cluster-autoscaler/ai-travel-prod: "owned"`
+
+### Cluster Autoscaler (`modules/cluster-autoscaler`, ArgoCD `platform-cluster-autoscaler`)
 
 | Parameter | Value |
 |-----------|-------|
-| EC2NodeClass | `default`, AMI family AL2 (`al2@latest`), node role `ai-travel-prod-karpenter-node` |
-| Subnets | selected by tag `kubernetes.io/role/internal-elb=1` (private) |
-| Capacity types | `spot` + `on-demand` |
-| Instance types | t3.large, t3.xlarge, m5.large, m5.xlarge, m5a.large, m5a.xlarge |
-| Disruption | `WhenEmptyOrUnderutilized`, consolidate after 1m |
-| Limits | cpu 32, memory 64Gi; nodes expire after 720h |
+| Helm chart | `cluster-autoscaler` v9.46.6 from `kubernetes.github.io/autoscaler` |
+| Namespace | `kube-system` |
+| IRSA role | `arn:aws:iam::235270183260:role/ai-travel-prod-cluster-autoscaler` |
+| Expander | `least-waste` |
+| Scale-down utilization threshold | 50% |
+| Scale-down unneeded time | 10 minutes |
+| Scale-down delay after add | 10 minutes |
 
-> Larger instance types are used deliberately: CPU is barely used, but small
-> types like t3.small cap at ~11 pods (ENI/prefix limits). Bigger nodes pack more
-> pods, so Karpenter consolidates onto fewer nodes.
+The Cluster Autoscaler uses IRSA for AWS API access (no static credentials) and
+auto-discovers the node group via ASG tags. It calls the EC2 Auto Scaling API to
+set the desired capacity when pods are pending (scale-up) or nodes are
+underutilized (scale-down).
 
-### IRSA (IAM Roles for Service Accounts) (`modules/irsa`, `modules/karpenter`)
+### Pod Autoscaling — HPA
+
+All services use the standard Kubernetes **Horizontal Pod Autoscaler (HPA)** with
+CPU utilization metrics provided by `metrics-server`.
+
+| Service | Min Replicas | Max Replicas | CPU Target |
+|---------|-------------|-------------|-----------|
+| `user-service` | 2 | 5 | 70% |
+| `travel-service` | 2 | 5 | 70% |
+| `ai-service` | 2 | 5 | 70% |
+| `utility-service` | 2 | 5 | 70% |
+| `ai-worker` | 1 | 5 | 70% |
+| `frontend` | 2 | 10 | 60% (CPU) + 70% (Memory) |
+
+HPAs use `autoscaling/v2` with explicit scale-up/scale-down behavior policies for
+production-grade stability (5-minute scale-down stabilization window).
+
+### IRSA (IAM Roles for Service Accounts) (`modules/irsa`, `modules/cluster-autoscaler`)
 
 Each workload that needs AWS access has a dedicated IAM role bound to its
 Kubernetes service account via the cluster OIDC provider. Pods receive temporary
@@ -201,7 +227,7 @@ credentials through the projected OIDC token — no static keys on nodes.
 | `ai-service` SA | `bedrock:InvokeModel`, Secrets Manager read, SQS send |
 | `ai-worker` SA | SQS receive/delete, DynamoDB jobs table, Secrets Manager read |
 | `user-service` / `travel-service` / `utility-service` / `frontend` SAs | Secrets Manager read (own secrets) |
-| Karpenter controller SA | EC2 provisioning, pricing, instance profile, SQS interruption queue |
+| `cluster-autoscaler` SA | EC2 Auto Scaling describe/set-desired, EKS DescribeNodegroup |
 
 ---
 
@@ -222,16 +248,19 @@ Bedrock directly; long-running work is offloaded to an async pipeline.
        │                         [Bedrock Runtime — Nova Pro]
        │
        └── for long jobs ──► [SQS queue] ──► [ai-worker pods]
-                                   ▲                │ KEDA scales worker
-                                   └── queue depth ─┘ on SQS backlog (incl. zero)
+                                   ▲                │ HPA scales on CPU
+                                   └────────────────┘ (min 1, max 5)
 ```
 
-### Async Jobs (SQS + KEDA)
+### Async Jobs (SQS + HPA)
 
 `ai-worker` (`helm-charts/ai-worker`) consumes the SQS queue created in
-`modules/sqs`. A KEDA `ScaledObject` scales the worker on queue depth, including
-**scale-to-zero** when the queue is empty. Job state is tracked in a DynamoDB
-jobs table. IRSA grants the worker SQS + DynamoDB + Secrets access.
+`modules/sqs`. A standard Kubernetes HPA scales the worker based on CPU
+utilization. Job state is tracked in a DynamoDB jobs table. IRSA grants the
+worker SQS + DynamoDB + Secrets access.
+
+The worker continues to poll SQS and process messages exactly as before — only
+the scaling mechanism has changed from event-driven (queue depth) to CPU-based.
 
 ### Fallback Behavior
 
@@ -287,7 +316,7 @@ run **Alembic** migrations at pod startup.
                 ▼
 [ArgoCD]  root Application "planmyjourney-app-of-apps" (sync-wave -1)
   └── recurses argocd-apps/applications/ →
-        ├── infrastructure/  (gateway, kgateway[-crds], karpenter, keda,
+        ├── infrastructure/  (gateway, kgateway[-crds], cluster-autoscaler,
         │                      metrics-server, monitoring)
         ├── dev/   (per-service Applications)
         └── prod/  (per-service Applications)
@@ -356,14 +385,11 @@ in DynamoDB (`finops-cost-baselines`). See [FINOPS.md](FINOPS.md).
 | Component | Configuration |
 |-----------|---------------|
 | EKS control plane | managed (~$73/mo) |
-| Baseline nodes | 2 × t3.small + Karpenter (spot-preferred) dynamic capacity |
+| Managed node group | 3 × t3.medium on-demand (baseline); scales to 6 via Cluster Autoscaler |
 | RDS | db.t3.micro (single-AZ by default) |
 | NAT Gateways | 2 (largest variable cost; mitigated by VPC endpoints) |
 | VPC interface endpoints | 6 interface + 2 gateway |
 | Bedrock | usage-based (Nova Pro tokens) |
-
-> Karpenter prefers spot, consolidates aggressively, and uses larger instances
-> for pod density. KEDA scale-to-zero removes idle `ai-worker` cost.
 
 ---
 

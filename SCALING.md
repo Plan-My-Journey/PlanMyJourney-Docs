@@ -7,7 +7,7 @@ traffic loads while maintaining cost efficiency:
 
 | Layer | Technology | What Scales | Trigger |
 |-------|-----------|-------------|---------|
-| **Pod (horizontal)** | Kubernetes HPA | Replica count per service | CPU/memory utilization |
+| **Pod (horizontal)** | Kubernetes HPA | Replica count per service | CPU utilization |
 | **Node (horizontal)** | Cluster Autoscaler | EC2 nodes in EKS node group | Pending pod scheduling |
 | **Database (vertical)** | RDS instance resize | CPU/memory/IOPS per DB instance | Manual, during maintenance window |
 
@@ -22,17 +22,22 @@ The general scaling philosophy:
 
 ### Current HPA Configuration
 
-| Service | Min Replicas | Max Replicas | CPU Target | Memory Target | Notes |
-|---------|-------------|-------------|-----------|--------------|-------|
-| `frontend` | 2 | 8 | 70% | — | SSR workload, scales well |
-| `user-service` | 2 | 6 | 70% | 80% | DB-bound, check connections |
-| `travel-service` | 2 | 6 | 70% | 80% | DB-bound |
-| `ai-service` | 2 | 4 | 60% | 80% | Bedrock calls are slow (2–5s) |
-| `utility-service` | 2 | 5 | 70% | 80% | External API rate limits apply |
+| Service | Min Replicas | Max Replicas | CPU Target | Notes |
+|---------|-------------|-------------|-----------|-------|
+| `user-service` | 2 | 5 | 70% | DB-bound, check connection pool |
+| `travel-service` | 2 | 5 | 70% | DB-bound |
+| `ai-service` | 2 | 5 | 70% | Bedrock calls are slow (2–5s), I/O-bound |
+| `utility-service` | 2 | 5 | 70% | External API rate limits apply |
+| `ai-worker` | 1 | 5 | 70% | SQS consumer; min 1 ensures queue is always drained |
+| `frontend` | 2 | 10 | 60% CPU + 70% Memory | nginx static serving |
 
 > **Note on `ai-service`:** Bedrock Nova Pro responses typically take 2–5 seconds. The service
-> is I/O-bound, not CPU-bound. The lower CPU target (60%) prevents overloading during latency
-> spikes when Bedrock is slow.
+> is I/O-bound during that wait. CPU utilization is a reasonable proxy — it rises as the thread
+> pool fills up with in-flight requests. Keep an eye on latency during peak loads.
+
+> **Note on `ai-worker`:** The worker polls SQS continuously. Its minimum replica count is 1
+> (not 0) so the queue is always being consumed. It scales up under CPU pressure as processing
+> throughput increases.
 
 ### How HPA Works — Timeline
 
@@ -54,45 +59,43 @@ T+360s  Old pod gracefully terminated (SIGTERM, 30s grace period)
 ### HPA Manifest Reference
 
 ```yaml
-# infrastructure/helm-charts/user-service/templates/hpa.yaml
+# Example: helm-charts/user-service/templates/hpa.yaml
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
   name: user-service
-  namespace: ai-travel
+  namespace: prod
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
     name: user-service
   minReplicas: 2
-  maxReplicas: 6
+  maxReplicas: 5
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilizationPercentage: 70
-    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilizationPercentage: 80
+          averageUtilization: 70
   behavior:
-    scaleUp:
-      stabilizationWindowSeconds: 0      # Scale up immediately
-      policies:
-        - type: Pods
-          value: 2                        # Add max 2 pods per 60 seconds
-          periodSeconds: 60
     scaleDown:
-      stabilizationWindowSeconds: 300    # Wait 5 minutes before scaling down
+      stabilizationWindowSeconds: 300   # Wait 5 min before scaling down
       policies:
         - type: Pods
-          value: 1                        # Remove max 1 pod per 120 seconds
-          periodSeconds: 120
+          value: 1
+          periodSeconds: 60             # Remove at most 1 pod per minute
+    scaleUp:
+      stabilizationWindowSeconds: 0    # Scale up immediately
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60            # Add up to 2 pods per minute
+        - type: Percent
+          value: 100
+          periodSeconds: 60            # Or double the count, whichever is larger
+      selectPolicy: Max
 ```
 
 ### Tuning HPA
@@ -103,56 +106,35 @@ spec:
 |-------------|-------------------|--------|
 | CPU-intensive (compute) | 60–70% | Leave headroom for sudden spikes |
 | I/O-intensive (DB calls) | 70–80% | CPU stays low even under load |
-| Memory-intensive (caching) | 70% CPU, 80% memory | Memory leaks are harder to recover |
-| Long-running requests (AI) | 60% | Requests queue up quickly at high load |
+| Memory-intensive (caching) | 70% CPU | Memory leaks are harder to recover |
+| Long-running requests (AI) | 70% | Requests queue up quickly at high load |
 
-**When to use custom metrics (requests-per-second):**
+**When to increase `maxReplicas`:**
 
-CPU utilization is a lagging indicator for `ai-service` because Bedrock requests are mostly
-waiting (I/O), not using CPU. Consider using RPS-based scaling with KEDA (Kubernetes Event
-Driven Autoscaler) if you find HPA is not scaling fast enough:
-
-```yaml
-# KEDA ScaledObject for ai-service (RPS-based, requires Prometheus)
-apiVersion: keda.sh/v1alpha1
-kind: ScaledObject
-metadata:
-  name: ai-service-keda
-  namespace: ai-travel
-spec:
-  scaleTargetRef:
-    name: ai-service
-  minReplicaCount: 2
-  maxReplicaCount: 4
-  triggers:
-    - type: prometheus
-      metadata:
-        serverAddress: http://prometheus.monitoring:9090
-        metricName: http_requests_per_second
-        query: rate(http_requests_total{service="ai-service"}[2m])
-        threshold: "10"   # Scale when >10 RPS per pod
-```
+If `kubectl get hpa` shows replicas constantly at the max and CPU is still above target,
+increase `maxReplicas` in the service's `values.yaml` and push to GitOps. ArgoCD will apply
+the change within 3 minutes.
 
 ### Monitoring HPA
 
 ```bash
 # View HPA status and current metrics
-kubectl get hpa -n ai-travel
+kubectl get hpa -n prod
 
 # Detailed HPA status (shows scaling events)
-kubectl describe hpa user-service -n ai-travel
+kubectl describe hpa user-service -n prod
 # Look for: "ScalingActive", "AbleToScale", "ScalingLimited"
 # And the "Events:" section for recent scaling decisions
 
 # Watch HPA in real-time
-watch kubectl get hpa -n ai-travel
+watch kubectl get hpa -n prod
 
 # View current pod resource usage
-kubectl top pods -n ai-travel --sort-by=cpu
-kubectl top pods -n ai-travel --sort-by=memory
+kubectl top pods -n prod --sort-by=cpu
+kubectl top pods -n prod --sort-by=memory
 
 # Historical HPA events
-kubectl get events -n ai-travel \
+kubectl get events -n prod \
   --field-selector reason=SuccessfulRescale \
   --sort-by='.lastTimestamp'
 ```
@@ -170,7 +152,7 @@ kubectl get events -n ai-travel \
 Pod is Pending (can't fit on any existing node)
       │
       ▼ (cluster-autoscaler, runs every 10s)
-CA scans pending pods and calculates required node size
+CA scans pending pods and calculates required node count
       │
       ▼
 CA calls AWS Auto Scaling API: SetDesiredCapacity(current + 1)
@@ -195,12 +177,26 @@ EC2 instance terminates (~5 minutes total)
 |-----------|-------|
 | Instance type | t3.medium (2 vCPU, 4 GB RAM) |
 | AMI | Amazon Linux 2 (managed by EKS) |
-| Min nodes | 2 |
-| Max nodes | 5 |
+| Min nodes | 3 |
+| Desired nodes | 3 |
+| Max nodes | 6 |
+| Capacity type | On-Demand |
 | Scale-up trigger | Any pod in `Pending` state due to insufficient resources |
 | Scale-down threshold | Node request utilization < 50% for 10 minutes |
 | Scale-down delay after add | 10 minutes (prevents oscillation) |
-| Max scale-up per iteration | 1 node |
+| Expander | `least-waste` (chooses the node group that wastes the least resources) |
+
+### Cluster Autoscaler Configuration (`platform-cluster-autoscaler`)
+
+The Cluster Autoscaler is deployed via Helm chart `cluster-autoscaler` v9.46.6
+into `kube-system` and managed by ArgoCD. It uses IRSA for AWS API access.
+
+Key settings:
+- **Auto-discovery**: Finds the node group via ASG tags `k8s.io/cluster-autoscaler/enabled=true`
+  and `k8s.io/cluster-autoscaler/ai-travel-prod=owned`
+- **IRSA role**: `arn:aws:iam::235270183260:role/ai-travel-prod-cluster-autoscaler`
+- **Permissions**: `autoscaling:SetDesiredCapacity`, `autoscaling:TerminateInstanceInAutoScalingGroup`
+  (scoped to tagged ASGs only), plus read-only describe permissions
 
 ### Pod Disruption Budgets (PDB)
 
@@ -213,12 +209,12 @@ apiVersion: policy/v1
 kind: PodDisruptionBudget
 metadata:
   name: user-service-pdb
-  namespace: ai-travel
+  namespace: prod
 spec:
   minAvailable: 1
   selector:
     matchLabels:
-      app: user-service
+      app.kubernetes.io/name: user-service
 ```
 
 ### When to Upgrade Node Size
@@ -227,37 +223,33 @@ spec:
 |---------|---------|-------------------|
 | Pods OOMKilled frequently | `kubectl describe pod` shows `OOMKilled` reason | Increase pod memory limits or upgrade to t3.large |
 | CPU throttling constant | `kubectl top pods` shows CPU near limit | Increase CPU limits or upgrade node type |
-| 5 nodes not enough | Cluster Autoscaler logs: "max nodes reached" | Increase `max_size` in Terraform |
-| Scale-up takes too long | Pod stuck `Pending` >5 minutes | Add a second node group or pre-scale |
+| 6 nodes not enough | Cluster Autoscaler logs: "max node group size reached" | Increase `node_group_max_size` in Terraform |
+| Scale-up takes too long | Pod stuck `Pending` >5 minutes | Pre-scale or add a second node group |
 
 ### Terraform Changes for Node Scaling
 
 ```hcl
-# infrastructure/terraform/environments/prod.tfvars
+# PlanMyjourney-Terraform/environments/prod.tfvars
 
 # Option A: Increase maximum node count (scale out)
-node_group_min_size     = 2
-node_group_max_size     = 10      # was 5
-node_group_desired_size = 2       # autoscaler manages this
+node_group_min_size     = 3
+node_group_max_size     = 10      # was 6
+node_group_desired_size = 3       # Cluster Autoscaler manages this
 
 # Option B: Upgrade node type (scale up)
 node_instance_types     = ["t3.large"]   # was ["t3.medium"]
 # t3.large: 2 vCPU, 8 GB RAM — doubles memory per node
 # t3.xlarge: 4 vCPU, 16 GB RAM — for compute-heavy workloads
-
-# Option C: Mixed instance policy (Spot + On-Demand for cost savings)
-# Enable in eks module: use_mixed_instances_policy = true
-# on_demand_percentage_above_base_capacity = 50  # 50% on-demand, 50% spot
 ```
 
 **Apply the change:**
 
 ```bash
-cd infrastructure/terraform
-terraform plan -var-file="environments/prod.tfvars" -target=module.eks.aws_eks_node_group.main
+cd PlanMyjourney-Terraform
+terraform plan -var-file="environments/prod.tfvars" -target=module.eks.aws_eks_node_group.workers
 # Review: node group update will trigger rolling replacement (~5 min per node)
 
-terraform apply -var-file="environments/prod.tfvars" -target=module.eks.aws_eks_node_group.main
+terraform apply -var-file="environments/prod.tfvars" -target=module.eks.aws_eks_node_group.workers
 ```
 
 > **Zero-downtime:** Rolling node replacement respects PodDisruptionBudgets and drains nodes
@@ -274,13 +266,18 @@ kubectl logs -n kube-system \
 # Key log messages to watch for:
 # "Scale up: setting group ... to X" — scaling up
 # "Scale down: removing node ..." — scaling down
-# "max node group size reached" — need to increase max_size
+# "max node group size reached" — need to increase node_group_max_size
 
 # Check current node count
-kubectl get nodes | wc -l
+kubectl get nodes
 
 # Check pending pods (scale-up trigger)
 kubectl get pods -A | grep Pending
+
+# Watch node auto-scaling events
+kubectl get events -n kube-system \
+  --field-selector reason=TriggeredScaleUp \
+  --sort-by='.lastTimestamp'
 ```
 
 ---
@@ -322,25 +319,24 @@ db.r6g.large (2 vCPU, 16 GB, Graviton, 1000+ max conn)
 
 ```bash
 # 1. Update Terraform variable
-# infrastructure/terraform/environments/prod.tfvars
-rds_instance_class = "db.t3.small"
+# PlanMyjourney-Terraform/environments/prod.tfvars
+db_instance_class = "db.t3.small"
 
 # 2. Check what will change
-cd infrastructure/terraform
+cd PlanMyjourney-Terraform
 terraform plan -var-file="environments/prod.tfvars" -target=module.rds
 
 # 3. Schedule during low-traffic window (the failover takes ~20s)
-# Apply with --apply-immediately for urgent cases, or wait for maintenance window
 terraform apply -var-file="environments/prod.tfvars" -target=module.rds
 
 # 4. Monitor the modification
 aws rds describe-db-instances \
   --db-instance-identifier ai-travel-prod \
-  --region ap-south-1 \
+  --region us-east-1 \
   --query "DBInstances[0].{Status: DBInstanceStatus, Class: DBInstanceClass}"
 
 # 5. Verify applications reconnect (SQLAlchemy pool_pre_ping handles this)
-kubectl get pods -n ai-travel | grep -v Running
+kubectl get pods -n prod | grep -v Running
 # A brief connection reset is normal; pods should not crash
 ```
 
@@ -366,72 +362,6 @@ without risking "too many connections" errors.
 | Reduce pool_size (5 instead of 10) | Free | None | 2× more pods |
 | Add PgBouncer connection pooler | Free (add pod) | None | 100s of pods |
 | RDS Proxy | +$20/month | None | Unlimited |
-
-**PgBouncer deployment (recommended for >10 replicas per service):**
-
-```yaml
-# Add to Helm chart: templates/pgbouncer.yaml
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: pgbouncer
-  namespace: ai-travel
-spec:
-  replicas: 2
-  template:
-    spec:
-      containers:
-        - name: pgbouncer
-          image: bitnami/pgbouncer:latest
-          env:
-            - name: POSTGRESQL_HOST
-              value: "<rds-endpoint>"
-            - name: POSTGRESQL_PORT
-              value: "5432"
-            - name: PGBOUNCER_POOL_MODE
-              value: "transaction"         # Best for microservices
-            - name: PGBOUNCER_MAX_CLIENT_CONN
-              value: "500"
-            - name: PGBOUNCER_DEFAULT_POOL_SIZE
-              value: "20"
-```
-
-### Adding a Read Replica
-
-For read-heavy workloads (analytics, reporting), a read replica offloads SELECT queries from
-the primary instance without requiring an upgrade.
-
-```hcl
-# infrastructure/terraform/modules/rds/read-replica.tf
-resource "aws_db_instance" "read_replica" {
-  identifier             = "ai-travel-prod-read"
-  replicate_source_db    = aws_db_instance.main.identifier
-  instance_class         = "db.t3.micro"
-  publicly_accessible    = false
-  skip_final_snapshot    = true
-  deletion_protection    = false
-
-  tags = {
-    Name    = "ai-travel-prod-read-replica"
-    Project = "ai-travel"
-    Role    = "read-replica"
-  }
-}
-
-output "rds_read_endpoint" {
-  value = aws_db_instance.read_replica.endpoint
-}
-```
-
-```python
-# In the application: use separate read/write connections
-write_engine = create_engine(os.environ["DATABASE_URL"])           # Primary
-read_engine  = create_engine(os.environ["DATABASE_READ_URL"])      # Read replica
-
-# Route read-only queries to the replica:
-with read_engine.connect() as conn:
-    results = conn.execute(text("SELECT * FROM trips WHERE user_id = :uid"), {"uid": user_id})
-```
 
 ---
 
@@ -480,22 +410,13 @@ export const options = {
 };
 
 export default function () {
-  const response = http.get('https://api.aitravel.com/health');
+  const response = http.get('https://api.invest-iq.online/health');
   check(response, {
     'status is 200': (r) => r.status === 200,
     'response time < 200ms': (r) => r.timings.duration < 200,
   });
   sleep(1);
 }
-```
-
-**Run the test:**
-
-```bash
-k6 run tests/load/health-check.js
-
-# With output to InfluxDB for Grafana visualization
-k6 run --out influxdb=http://localhost:8086/k6 tests/load/health-check.js
 ```
 
 **AI Service load test (Bedrock calls):**
@@ -519,7 +440,7 @@ export default function () {
     message: "Plan a 3-day trip to Goa with a budget of $500"
   });
   const response = http.post(
-    'https://api.aitravel.com/ai/plan',
+    'https://api.invest-iq.online/api/ai/plan',
     payload,
     { headers: { 'Content-Type': 'application/json' } }
   );
@@ -535,13 +456,13 @@ export default function () {
 
 ```bash
 # In a separate terminal: watch pods scale
-watch kubectl get hpa,pods -n ai-travel
+watch kubectl get hpa,pods -n prod
 
 # Watch node scaling
 watch kubectl get nodes
 
 # Watch resource utilization
-watch kubectl top pods -n ai-travel
+watch kubectl top pods -n prod
 ```
 
 ---
@@ -552,38 +473,11 @@ Target latencies under normal load (< 50 concurrent users):
 
 | Service | p50 Latency | p95 Latency | p99 Latency | Max RPS | Notes |
 |---------|------------|------------|------------|---------|-------|
-| `frontend` | < 50ms | < 200ms | < 500ms | 500 RPS | Next.js SSR with CDN |
+| `frontend` | < 50ms | < 200ms | < 500ms | 500 RPS | nginx static serving |
 | `user-service` | < 100ms | < 500ms | < 1,000ms | 200 RPS | DB-bound |
 | `travel-service` | < 100ms | < 400ms | < 800ms | 150 RPS | DB-bound |
 | `ai-service` | < 2,000ms | < 5,000ms | < 10,000ms | 10 RPS | Bedrock latency dominates |
 | `utility-service` | < 200ms | < 1,000ms | < 2,000ms | 100 RPS | External API latency |
-
-**Bedrock latency breakdown (Nova Pro, ap-south-1):**
-- Network to Bedrock VPC endpoint: < 5ms (stays in VPC)
-- Model inference time: 1,500–4,000ms (varies by prompt length)
-- Response streaming (if enabled): first token in ~500ms
-
-### Identifying Performance Bottlenecks
-
-```bash
-# Check which pods are using the most CPU
-kubectl top pods -n ai-travel --sort-by=cpu
-
-# Check which pods are using the most memory
-kubectl top pods -n ai-travel --sort-by=memory
-
-# Check RDS slow query log
-aws rds describe-db-log-files \
-  --db-instance-identifier ai-travel-prod \
-  --filename-contains "slowquery" \
-  --region ap-south-1
-
-# Enable slow query log if not already on (adds ~5% overhead)
-aws rds modify-db-parameter-group \
-  --db-parameter-group-name ai-travel-prod-pg15 \
-  --parameters "ParameterName=log_min_duration_statement,ParameterValue=1000,ApplyMethod=immediate"
-# Now all queries >1000ms are logged to CloudWatch
-```
 
 ---
 
@@ -593,29 +487,30 @@ Follow this runbook when receiving alerts about high latency or pod overload:
 
 ```
 1. CHECK current state
-   kubectl get hpa -n ai-travel     # Is HPA already scaling?
-   kubectl top pods -n ai-travel    # Which service is overloaded?
-   kubectl get nodes                # Are nodes available?
+   kubectl get hpa -n prod          # Is HPA already scaling?
+   kubectl top pods -n prod         # Which service is overloaded?
+   kubectl get nodes                 # Are nodes available?
 
 2. IDENTIFY the overloaded service
    # Look for: CPU > 80% in `kubectl top pods` output
 
 3. MANUAL SCALE (if HPA is slow to react)
-   kubectl scale deployment user-service --replicas=4 -n ai-travel
+   kubectl scale deployment user-service --replicas=4 -n prod
 
 4. CHECK if nodes are the bottleneck
-   kubectl get pods -n ai-travel | grep Pending
-   # If Pending: cluster autoscaler is adding a node (wait 3–5 min)
+   kubectl get pods -n prod | grep Pending
+   # If Pending: Cluster Autoscaler is adding a node (wait 3–5 min)
+   # Check CA logs: kubectl logs -n kube-system -l app.kubernetes.io/name=cluster-autoscaler --tail=50
 
 5. CHECK database connections
-   kubectl logs -l app=user-service -n ai-travel | grep "too many connections"
+   kubectl logs -l app.kubernetes.io/name=user-service -n prod | grep "too many connections"
    # If yes: reduce replicas or add PgBouncer
 
 6. AFTER TRAFFIC SUBSIDES
    # HPA will scale down automatically after 5 minutes
-   # Verify with: kubectl get hpa -n ai-travel
+   # Verify with: kubectl get hpa -n prod
 
 7. POST-INCIDENT
    # Review CloudWatch metrics and adjust HPA thresholds if needed
-   # Consider Reserved Instances if peak traffic is recurring
+   # Consider increasing node_group_max_size if CA hit the ceiling
 ```
