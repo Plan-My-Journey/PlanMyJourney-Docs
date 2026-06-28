@@ -1,184 +1,207 @@
 # AI-Travel-Planner: Architecture Overview
 
+> Source of truth: this document is reconciled against the live Terraform
+> (`PlanMyjourney-Terraform`, `environments/prod.tfvars`) and GitOps
+> (`PlanMyJourney-Gitops`) repositories. Where a value is environment-specific it
+> is taken from `prod.tfvars`.
+
 ## System Architecture
 
 ### High-Level Overview
 
 ```
-                            Internet
-                               │
-                               ▼
-                        [Route53 DNS]
-                    aitravel.com → ALB
-                               │
-                               ▼
-                   ┌──────────────────────┐
-                   │  AWS ALB (internet-  │
-                   │  facing, HTTPS only) │
-                   └──────────┬───────────┘
-                              │  HTTPS :443
-                              ▼
-              ┌───────────────────────────────┐
-              │         EKS Cluster           │
-              │      (ap-south-1, v1.29)      │
-              │                               │
-              │  ┌─────────────────────────┐  │
-              │  │   nginx-ingress         │  │
-              │  │   (IngressClass: nginx) │  │
-              │  └────────────┬────────────┘  │
-              │               │               │
-              │   ┌───────────┼───────────┐   │
-              │   │           │           │   │
-              │   ▼           ▼           ▼   │
-              │ [frontend] [api-gw]  [argocd] │
-              │              │               │
-              │   ┌──────────┼───────────┐   │
-              │   │          │           │   │
-              │   ▼          ▼           ▼   │
-              │ [user-svc] [travel-svc] [ai-svc]
-              │   │          │           │   │
-              │   │       [utility-svc]  │   │
-              │   │                      │   │
-              └───┼──────────────────────┼───┘
-                  │                      │
-                  ▼                      ▼
-          [RDS PostgreSQL]      [AWS Bedrock]
-           (Multi-AZ)           Nova Pro v1
-        user_db + travel_db   (via VPC endpoint)
-                               ap-south-1
+                              Internet
+                                 │
+            invest-iq.online / www │ api.invest-iq.online
+                                 ▼
+                          [Route53 DNS]
+                                 │
+                                 ▼
+                   ┌──────────────────────────┐
+                   │  AWS NLB (internet-facing)│
+                   │  TLS :443 terminated here │
+                   │  (ACM cert, us-east-1)    │
+                   └────────────┬─────────────┘
+                                │  plain HTTP
+                                ▼
+              ┌───────────────────────────────────────┐
+              │   EKS Cluster  "ai-travel-prod"        │
+              │      (us-east-1, Kubernetes 1.30)      │
+              │                                        │
+              │  ns kgateway-system:                   │
+              │   ┌──────────────────────────────┐     │
+              │   │ Gateway "api-gateway"        │     │
+              │   │ GatewayClass: kgateway       │     │
+              │   │ (Envoy proxy; provisions NLB)│     │
+              │   └──────────────┬───────────────┘     │
+              │                  │  HTTPRoutes          │
+              │                  │  (strip /api prefix) │
+              │  ns prod:        ▼                      │
+              │   /            → [frontend  :80]        │
+              │   /api/auth,users → [user-service :8000]│
+              │   /api/trips,expenses → [travel-svc:8000]
+              │   /api/ai      → [ai-service :8000]     │
+              │   /api/weather,hotels… → [utility:8000] │
+              │                  │            │         │
+              │   [ai-service] ──┘  SQS send  │         │
+              │   [ai-worker] ◄ KEDA scales on queue    │
+              │                                        │
+              │  Platform (GitOps-managed):            │
+              │   ArgoCD · KGateway · Karpenter · KEDA  │
+              │   · metrics-server · kube-prometheus    │
+              └───────┬───────────────────┬────────────┘
+                      │                   │
+                      ▼                   ▼
+              [RDS PostgreSQL]      [AWS Bedrock — Nova Pro]
+               db.t3.micro          (InvokeModel via IRSA;
+               user_db + travel_db   egress via NAT, no VPC endpoint)
+               (private DB subnets)
 ```
 
 ### Request Flow
 
-1. User browser → Route53 resolves `aitravel.com` → ALB DNS
-2. ALB terminates HTTPS/TLS (ACM certificate), HTTP → HTTPS redirect
-3. ALB → nginx-ingress controller pod (target group binding)
-4. nginx-ingress routes by path prefix:
-   - `/` → `frontend` service (Next.js SSR)
-   - `/api/users/*` → `user-service` (FastAPI)
-   - `/api/travel/*` → `travel-service` (FastAPI)
-   - `/api/ai/*` → `ai-service` (FastAPI + Bedrock)
-   - `/api/utility/*` → `utility-service` (FastAPI)
-5. Backend services read secrets from Secrets Manager at startup (via IRSA)
-6. `ai-service` calls Bedrock Converse API via VPC endpoint (never exits VPC)
+1. User browser → Route53 resolves `invest-iq.online` (frontend) or
+   `api.invest-iq.online` (API) → NLB DNS name.
+2. **NLB terminates HTTPS/TLS** using the ACM certificate (us-east-1), then
+   forwards **plain HTTP** to the KGateway Envoy proxy. The `Gateway` listener is
+   declared `protocol: HTTP` on `port: 443` precisely because TLS is handled at
+   the NLB (`gateway/base/gateway.yaml`).
+3. KGateway `Gateway` "api-gateway" (namespace `kgateway-system`) routes to
+   `HTTPRoute` objects in namespace `prod`.
+4. HTTPRoutes match by path prefix and apply a `URLRewrite` filter that **strips
+   `/api`** before forwarding (e.g. `/api/users` → `/users`). Longest-prefix wins,
+   so `/api/*` beats the frontend catch-all `/`.
+5. Request reaches the backend `Service` (`:8000` APIs, `:80` frontend) → Pod.
+6. Backend services read secrets from Secrets Manager at startup (via IRSA).
+7. `ai-service` calls the Bedrock Converse/InvokeModel API (Nova Pro) using its
+   IRSA role; long-running generations are pushed to SQS and processed
+   asynchronously by `ai-worker` (scaled by KEDA on queue depth).
+
+> **Ingress note:** There is **no nginx-ingress and no ALB** in the live path.
+> The legacy Terraform ALB module is disabled (`enable_legacy_alb = false`).
+> Public ingress is Route53 → NLB → KGateway (Envoy) → Service → Pod. The NLB is
+> provisioned automatically by KGateway from the `Gateway` + `GatewayParameters`
+> objects, not by Terraform.
 
 ---
 
 ## Networking Architecture
 
-### VPC Design
+### VPC Design (`modules/vpc`)
 
 ```
-VPC: 10.0.0.0/16  (65,536 addresses)
+VPC: 10.0.0.0/16  (65,536 addresses)  — us-east-1
 │
-├── Public Subnets (ALB only — no pods)
-│   ├── ap-south-1a: 10.0.1.0/24  (256 addresses)
-│   └── ap-south-1b: 10.0.2.0/24  (256 addresses)
+├── Public Subnets (NLB only — no pods)   tag kubernetes.io/role/elb=1
+│   ├── us-east-1a: 10.0.1.0/24
+│   └── us-east-1b: 10.0.2.0/24
 │
-├── Private Subnets (EKS nodes + pods)
-│   ├── ap-south-1a: 10.0.10.0/24  (256 addresses)
-│   └── ap-south-1b: 10.0.11.0/24  (256 addresses)
+├── Private Subnets (EKS nodes + pods)    tag kubernetes.io/role/internal-elb=1
+│   ├── us-east-1a: 10.0.10.0/24
+│   └── us-east-1b: 10.0.11.0/24
 │
 └── Database Subnets (RDS — no internet route)
-    ├── ap-south-1a: 10.0.20.0/24  (256 addresses)
-    └── ap-south-1b: 10.0.21.0/24  (256 addresses)
+    ├── us-east-1a: 10.0.20.0/24
+    └── us-east-1b: 10.0.21.0/24
 ```
 
 ### Traffic Routing
 
 | Traffic Type | Path |
 |-------------|------|
-| Inbound HTTPS | Internet → ALB (public subnet) → nginx-ingress pod (private subnet) |
+| Inbound HTTPS | Internet → NLB (public subnet) → KGateway Envoy pod (private subnet) |
 | Outbound (pods → internet) | Pod → NAT GW (public subnet) → Internet Gateway |
-| AWS API calls (ECR, Secrets, Bedrock) | Pod → VPC Endpoint (stays in VPC, no NAT cost) |
+| AWS API calls (ECR, Secrets, SSM, S3, DynamoDB) | Pod → VPC Endpoint (stays in VPC, no NAT cost) |
+| Bedrock calls | Pod → NAT GW → Internet (no Bedrock VPC endpoint configured) |
 | RDS connections | Pod (private subnet) → RDS (database subnet) — direct, no NAT |
 
 ### NAT Gateways
 
-Two NAT Gateways are deployed (one per AZ) for high availability:
+Two NAT Gateways are deployed (one per AZ) for high availability, each with a
+dedicated Elastic IP. Private subnet route tables send `0.0.0.0/0` to the NAT GW
+in the same AZ. Database route tables have **no** `0.0.0.0/0` route (no internet).
 
-- `nat-gw-ap-south-1a` → attached to `10.0.1.0/24` (public subnet AZ-a)
-- `nat-gw-ap-south-1b` → attached to `10.0.2.0/24` (public subnet AZ-b)
+> **Cost note:** NAT Gateway data processing is the largest variable cost driver.
+> VPC Endpoints eliminate NAT charges for the AWS APIs they cover.
 
-Private subnet route tables use the NAT GW in the same AZ for egress.
+### VPC Endpoints (`modules/vpc`)
 
-> **Cost note:** NAT Gateway data processing charges ($0.045/GB) are the single largest
-> variable cost driver. VPC Endpoints eliminate NAT charges for AWS API traffic.
-
-### VPC Endpoints
-
-| Endpoint | Type | Services Covered |
-|----------|------|-----------------|
-| S3 Gateway | Gateway (free) | ECR image layers, S3 access |
-| DynamoDB Gateway | Gateway (free) | Terraform state lock, FinOps DynamoDB |
-| ECR API | Interface | `ecr.ap-south-1.amazonaws.com` |
-| ECR DKR | Interface | `*.dkr.ecr.ap-south-1.amazonaws.com` |
+| Endpoint | Type | Purpose |
+|----------|------|---------|
+| S3 | Gateway (free) | ECR image layers, S3 access (attached to private + database RTs) |
+| DynamoDB | Gateway (free) | FinOps tables / app DynamoDB access |
 | Secrets Manager | Interface | Secret reads at pod startup |
-| SSM | Interface | Parameter Store access |
-| SSM Messages | Interface | Session Manager (bastion-less access) |
-| Bedrock Runtime | Interface | `bedrock-runtime.ap-south-1.amazonaws.com` |
+| ECR API | Interface | `ecr.api` — auth/metadata for image pulls |
+| ECR DKR | Interface | `ecr.dkr` — image layer pulls |
+| SSM | Interface | Parameter Store / SSM access |
+| SSM Messages | Interface | Session Manager control channel |
+| EC2 Messages | Interface | Session Manager / SSM agent channel |
 
-### Security Groups
+> There is intentionally **no Bedrock interface endpoint** today; `ai-service`
+> reaches Bedrock through the NAT Gateway. Adding a `bedrock-runtime` interface
+> endpoint is a possible future optimization to keep that traffic in-VPC.
 
-| SG Name | Inbound | Outbound |
-|---------|---------|----------|
-| `alb-sg` | 0.0.0.0/0:443, 0.0.0.0/0:80 | EKS nodes:30000-32767 |
-| `eks-node-sg` | ALB SG:all, self | 0.0.0.0/0:all |
-| `rds-sg` | EKS node SG:5432 | None |
-| `vpc-endpoint-sg` | VPC CIDR:443 | None |
+### Security Groups (`modules/vpc` + service modules)
+
+| SG | Inbound | Outbound |
+|----|---------|----------|
+| `ai-travel-prod-alb-sg` | 0.0.0.0/0:80, 0.0.0.0/0:443 | VPC CIDR (all) |
+| `ai-travel-prod-eks-cluster-sg` | 443 from alb-sg; all from self (node-to-node) | 0.0.0.0/0 (all) |
+| `ai-travel-prod-vpc-endpoints-sg` | 443 from VPC CIDR | 0.0.0.0/0 |
+| RDS SG (`modules/rds`) | 5432 from EKS node/cluster SG | — |
 
 ---
 
 ## Compute (EKS)
 
-### Cluster Configuration
+### Cluster Configuration (`modules/eks`, `prod.tfvars`)
 
 | Parameter | Value |
 |-----------|-------|
-| Kubernetes version | 1.29 |
-| Control plane | AWS managed (private endpoint only) |
-| OIDC provider | Enabled (required for IRSA) |
-| Cluster logging | API, audit, authenticator → CloudWatch |
-| CNI | AWS VPC CNI with prefix delegation |
+| Cluster name | `ai-travel-prod` |
+| Kubernetes version | 1.30 |
+| OIDC provider | Enabled (required for IRSA and Karpenter) |
+| Worker placement | Private subnets only |
 
-### Node Group
+### Baseline Managed Node Group
 
 | Parameter | Value |
 |-----------|-------|
-| Instance type | t3.medium (2 vCPU, 4 GB RAM) |
-| AMI | Amazon Linux 2 (AL2) |
-| Min nodes | 2 |
-| Max nodes | 5 |
-| Desired nodes | 2 |
-| Disk | 50 GB gp3 EBS |
-| Placement | Private subnets only |
+| Instance type | t3.small |
+| Min / Desired / Max | 2 / 2 / 5 |
+| Disk | 50 GB EBS |
 
-### Kubernetes Add-ons
+The managed node group is the **baseline** that runs cluster-critical add-ons
+(ArgoCD, KGateway, Karpenter itself, KEDA, metrics-server, monitoring). Dynamic
+application capacity is provided by **Karpenter**.
 
-| Add-on | Version | Purpose |
-|--------|---------|---------|
-| aws-vpc-cni | latest | Pod networking (prefix delegation for higher pod density) |
-| coredns | latest | Cluster DNS |
-| kube-proxy | latest | iptables rules for services |
-| aws-ebs-csi-driver | latest | Persistent volumes for stateful workloads |
-| cluster-autoscaler | v1.29.x | Automatic node scaling |
-| aws-load-balancer-controller | v2.7.x | ALB ingress management |
+### Karpenter NodePool (`PlanMyJourney-Gitops/platform/karpenter`)
 
-### IRSA (IAM Roles for Service Accounts)
+| Parameter | Value |
+|-----------|-------|
+| EC2NodeClass | `default`, AMI family AL2 (`al2@latest`), node role `ai-travel-prod-karpenter-node` |
+| Subnets | selected by tag `kubernetes.io/role/internal-elb=1` (private) |
+| Capacity types | `spot` + `on-demand` |
+| Instance types | t3.large, t3.xlarge, m5.large, m5.xlarge, m5a.large, m5a.xlarge |
+| Disruption | `WhenEmptyOrUnderutilized`, consolidate after 1m |
+| Limits | cpu 32, memory 64Gi; nodes expire after 720h |
 
-Each service has a dedicated IAM role bound to its Kubernetes service account. Pods receive
-temporary AWS credentials via the OIDC token projected into the pod (no static keys on nodes).
+> Larger instance types are used deliberately: CPU is barely used, but small
+> types like t3.small cap at ~11 pods (ENI/prefix limits). Bigger nodes pack more
+> pods, so Karpenter consolidates onto fewer nodes.
 
-| Service Account | IAM Role Permissions |
-|-----------------|---------------------|
-| `user-service-sa` | `secretsmanager:GetSecretValue` (user-service secrets) |
-| `travel-service-sa` | `secretsmanager:GetSecretValue` (travel-service secrets) |
-| `ai-service-sa` | `bedrock:InvokeModel`, `secretsmanager:GetSecretValue` |
-| `utility-service-sa` | `secretsmanager:GetSecretValue` (utility API keys) |
-| `frontend-sa` | `secretsmanager:GetSecretValue` (frontend config) |
-| `cluster-autoscaler-sa` | `autoscaling:*`, `ec2:DescribeInstanceTypes` |
-| `alb-controller-sa` | `elasticloadbalancing:*`, `ec2:*`, `iam:CreateServiceLinkedRole` |
-| `finops-sa` | `ce:*`, `compute-optimizer:*`, `cloudwatch:*`, `resourcegroupstagging:*` |
+### IRSA (IAM Roles for Service Accounts) (`modules/irsa`, `modules/karpenter`)
+
+Each workload that needs AWS access has a dedicated IAM role bound to its
+Kubernetes service account via the cluster OIDC provider. Pods receive temporary
+credentials through the projected OIDC token — no static keys on nodes.
+
+| Service Account | Permissions (intent) |
+|-----------------|----------------------|
+| `ai-service` SA | `bedrock:InvokeModel`, Secrets Manager read, SQS send |
+| `ai-worker` SA | SQS receive/delete, DynamoDB jobs table, Secrets Manager read |
+| `user-service` / `travel-service` / `utility-service` / `frontend` SAs | Secrets Manager read (own secrets) |
+| Karpenter controller SA | EC2 provisioning, pricing, instance profile, SQS interruption queue |
 
 ---
 
@@ -186,137 +209,98 @@ temporary AWS credentials via the OIDC token projected into the pod (no static k
 
 ### Bedrock Integration
 
-The `ai-service` is the core AI component responsible for generating travel plans, recommendations,
-and conversational assistance.
+`ai-service` generates travel plans and recommendations. Synchronous calls hit
+Bedrock directly; long-running work is offloaded to an async pipeline.
 
 ```
-[ai-service pod]
-    │
-    │  (OIDC token from service account)
-    ▼
-[AWS STS] ── assume role ──► [ai-service-irsa-role]
-                                    │
-                                    │  bedrock:InvokeModel
-                                    ▼
-                          [Bedrock Runtime API]
-                         (via VPC Interface Endpoint)
-                                    │
-                                    ▼
-                        [amazon.nova-pro-v1:0]
-                           (ap-south-1 region)
+[ai-service pod] ──OIDC token──► [STS AssumeRoleWithWebIdentity]
+       │                                   │
+       │                                   ▼
+       │                         [ai-service IRSA role]
+       │                                   │ bedrock:InvokeModel
+       │                                   ▼
+       │                         [Bedrock Runtime — Nova Pro]
+       │
+       └── for long jobs ──► [SQS queue] ──► [ai-worker pods]
+                                   ▲                │ KEDA scales worker
+                                   └── queue depth ─┘ on SQS backlog (incl. zero)
 ```
 
-### Converse API Usage
+### Async Jobs (SQS + KEDA)
 
-The service uses the Bedrock **Converse API** (not InvokeModel directly) for:
-- Unified message format across models
-- Built-in conversation history management
-- Streaming response support
-- Tool use / function calling
+`ai-worker` (`helm-charts/ai-worker`) consumes the SQS queue created in
+`modules/sqs`. A KEDA `ScaledObject` scales the worker on queue depth, including
+**scale-to-zero** when the queue is empty. Job state is tracked in a DynamoDB
+jobs table. IRSA grants the worker SQS + DynamoDB + Secrets access.
 
 ### Fallback Behavior
 
-If Bedrock is unavailable (model access not granted, service outage), `ai-service` returns
-pre-defined static travel recommendations rather than failing with a 500 error. This ensures
-the frontend remains functional in degraded mode.
-
-### Model Pricing (Nova Pro in ap-south-1)
-
-| Token Type | Price |
-|-----------|-------|
-| Input | ~$0.0008 per 1,000 tokens |
-| Output | ~$0.0032 per 1,000 tokens |
-| Context window | 300,000 tokens |
-
-Typical travel plan request: ~800 input tokens + ~500 output tokens = ~$0.002 per request.
+If Bedrock is unavailable (model access not granted, outage), `ai-service`
+returns pre-defined static recommendations rather than a 500, keeping the
+frontend functional in degraded mode.
 
 ---
 
 ## Database Architecture
 
-### RDS PostgreSQL Configuration
+### RDS PostgreSQL Configuration (`modules/rds`, `prod.tfvars`)
 
 | Parameter | Value |
 |-----------|-------|
-| Engine | PostgreSQL 15.4 |
+| Engine | PostgreSQL |
 | Instance class | db.t3.micro |
-| Multi-AZ | Yes (automatic failover to standby) |
-| Storage | 50 GB gp3, auto-scale to 100 GB |
-| Encryption | AWS KMS (CMK) |
-| Backup retention | 7 days |
-| Backup window | 02:00–03:00 UTC |
-| Maintenance window | Sun 04:00–05:00 UTC |
-| Performance Insights | Enabled, 7-day retention |
-| Enhanced Monitoring | 60-second intervals |
+| Multi-AZ | **Disabled by default** (`enable_rds_multi_az = false`); enable in a planned maintenance window |
+| Storage | 50 GB, autoscale to 100 GB |
+| Encryption | AWS KMS CMK (from `modules/secrets`) |
+| Backup retention | 30 days |
+| Credentials | master password stored in Secrets Manager (`modules/secrets`), never in code |
+| Placement | Database subnets (no internet route) |
 
 ### Logical Databases
 
-A single RDS instance hosts two logical databases, separated at the application level:
+A single RDS instance hosts the application data; services own their tables and
+run **Alembic** migrations at pod startup.
 
-| Database | Owner Service | Schema Migration |
-|----------|--------------|-----------------|
-| `user_db` | user-service | Alembic (runs at pod startup) |
-| `travel_db` | travel-service | Alembic (runs at pod startup) |
+| Owner Service | Migration |
+|--------------|-----------|
+| user-service | Alembic (`services/user-service/alembic`) |
+| travel-service | Alembic (`services/travel-service/alembic`) |
 
-### Connection Management
-
-```python
-# SQLAlchemy engine configuration (per service)
-engine = create_engine(
-    DATABASE_URL,
-    pool_size=10,           # Persistent connections
-    max_overflow=20,        # Temporary burst connections
-    pool_timeout=30,        # Wait time before "too many connections" error
-    pool_pre_ping=True,     # Verify connection health before use
-    pool_recycle=3600,      # Recycle connections every hour
-)
-```
-
-Max simultaneous DB connections formula:
-`max_connections = pods × (pool_size + max_overflow) = 2 × 30 = 60` (well within RDS limit of 87 for db.t3.micro)
+> Note: the DB master password must be alphanumeric — a percent-encoded password
+> breaks Alembic startup (URL parsing). See TROUBLESHOOTING.md.
 
 ---
 
 ## GitOps Architecture
 
-### App-of-Apps Pattern
+### App-of-Apps Pattern (`PlanMyJourney-Gitops/argocd-apps`)
 
 ```
-[Git Repository]
-      │  (push / PR merge)
-      │
+[GitHub: PlanMyJourney-App]
+      │  push / PR merge
       ▼
-[GitHub Actions CI]
-  ├── Run tests / lint
-  ├── Build Docker image
-  ├── Push to ECR
-  └── Update image tag in helm-charts/*/values.yaml
+[GitHub Actions CI]  (reusable workflows in PlanMyJourney-Workflows)
+  ├── lint, SAST, SCA (quality gates)
+  ├── docker build → push to ECR
+  └── commit new image tag into PlanMyJourney-Gitops (Helm values)
                 │
-                │ (git commit [skip ci])
                 ▼
-[ArgoCD detects drift]
-  │
-  ├── Root Application (app-of-apps.yaml)
-  │     └── Manages child Applications
-  │           ├── frontend-app.yaml
-  │           ├── user-service-app.yaml
-  │           ├── travel-service-app.yaml
-  │           ├── ai-service-app.yaml
-  │           └── utility-service-app.yaml
-  │
-  └── Each child app: sync Helm chart → rolling update
+[ArgoCD]  root Application "planmyjourney-app-of-apps" (sync-wave -1)
+  └── recurses argocd-apps/applications/ →
+        ├── infrastructure/  (gateway, kgateway[-crds], karpenter, keda,
+        │                      metrics-server, monitoring)
+        ├── dev/   (per-service Applications)
+        └── prod/  (per-service Applications)
+  syncPolicy: automated { prune, selfHeal }, ServerSideApply, CreateNamespace
 ```
 
-### Sync Waves (Deployment Order)
+CI never runs `kubectl` — it ends at Git. ArgoCD (in-cluster) reconciles the
+desired state, so no CI runner holds cluster credentials (pull-based GitOps).
 
-| Wave | Resources | Purpose |
-|------|-----------|---------|
-| -1 | Namespaces, CRDs | Must exist before everything else |
-| 0 | Secrets CSI driver, cert-manager | Infrastructure dependencies |
-| 1 | nginx-ingress | Must be running before app ingresses |
-| 2 | user-service, travel-service, utility-service | Core backend services |
-| 3 | ai-service | Depends on other services for context |
-| 4 | frontend | Depends on all backend APIs |
+### Sync Waves (ordering)
+
+Sync waves order platform CRDs/controllers before workloads (e.g. the app-of-apps
+root is wave `-1`; gateway/CRDs and controllers come before application services).
 
 ---
 
@@ -325,106 +309,75 @@ Max simultaneous DB connections formula:
 ### Defense in Depth
 
 ```
-Layer 1 — Network:   VPC subnets, Security Groups, NACLs
-Layer 2 — TLS:       ALB terminates HTTPS, internal traffic HTTP (in-cluster)
-Layer 3 — AuthN/Z:   IRSA (pod-level AWS identity), Kubernetes RBAC
-Layer 4 — Secrets:   Secrets Manager (no env vars in YAML), CSI driver
-Layer 5 — Runtime:   Pod security contexts, read-only root filesystem
-Layer 6 — Supply Chain: ECR image scanning (Trivy), container signing
+Layer 1 — Network:   private subnets, Security Groups, DB isolation
+Layer 2 — TLS:       NLB terminates HTTPS (ACM); in-cluster traffic is HTTP
+Layer 3 — Identity:  IRSA (pod-level AWS identity via OIDC+STS); GitHub OIDC for CI
+Layer 4 — AuthN:     AWS Cognito user pool (hosted UI, OAuth callback/logout URLs)
+Layer 5 — Secrets:   Secrets Manager + KMS; no secrets in YAML/images/env
+Layer 6 — Policy:    NetworkPolicies per service; PodDisruptionBudgets
+Layer 7 — Supply chain: CI SAST/SCA gates + ECR image scanning
 ```
 
-### Network Policies
+### GitHub OIDC for CI
 
-Zero-trust NetworkPolicies are applied per namespace:
+GitHub Actions assumes an AWS IAM role via OIDC (no long-lived cloud keys). The
+allowed repos are pinned in `github_repos` and are **case-sensitive** — the OIDC
+`sub` claim and IAM `StringLike` matching are case-sensitive, so the canonical
+`Plan-My-Journey/...` casing must be used or STS returns "Not authorized".
 
-```yaml
-# Only allow travel-service → RDS on port 5432
-# Only allow ai-service → Bedrock endpoint on port 443
-# Deny all ingress to pods except from nginx-ingress namespace
-# Allow all pods egress to kube-dns for DNS resolution
-```
+### Cognito (`modules/cognito`)
 
-### Secrets Management
-
-All secrets are stored in AWS Secrets Manager and mounted into pods via the
-**AWS Secrets and Configuration Provider (ASCP)** CSI driver. No secrets appear in:
-- Kubernetes manifests
-- Helm values files
-- Environment variables in Deployments
-- ECR image layers
+User authentication uses a Cognito user pool with hosted UI domain prefix
+`planmyjourney`. Callback URLs: `https://invest-iq.online/callback` (+ localhost
+for dev); logout URLs mirror these.
 
 ### Encryption at Rest
 
 | Resource | Encryption |
 |----------|-----------|
-| RDS | KMS CMK (`ai-travel-rds-key`) |
-| EBS volumes (node disks) | KMS CMK (`ai-travel-ebs-key`) |
-| Secrets Manager | KMS CMK (`ai-travel-secrets-key`) |
-| CloudWatch Logs | KMS CMK (`ai-travel-logs-key`) |
+| RDS | KMS CMK (`modules/secrets`) |
+| Secrets Manager | KMS CMK |
+| EBS volumes / EKS | KMS CMK |
 | ECR images | AES-256 (AWS managed) |
-| S3 (state, logs) | SSE-S3 / SSE-KMS |
+| S3 (Terraform state, logs) | SSE |
 
 ---
 
 ## Cost Architecture
 
-### FinOps Infrastructure
+### FinOps Infrastructure (`modules/finops`)
 
-A dedicated Lambda function (`ai-travel-finops-cost-analyzer`) runs daily to analyze costs
-and generate AI-powered optimization recommendations. See [FINOPS.md](FINOPS.md) for full details.
+A Lambda function (`cost-anomaly-detector-prod`) runs on an EventBridge schedule
+to analyze costs and email reports (SES verified sender), with baselines stored
+in DynamoDB (`finops-cost-baselines`). See [FINOPS.md](FINOPS.md).
 
-### Estimated Monthly Costs (ap-south-1, June 2026)
+### Major Cost Drivers (us-east-1, low-traffic prod)
 
-| Component | Configuration | Est. Monthly Cost |
-|-----------|--------------|-------------------|
-| EKS Cluster control plane | Managed | $73 |
-| EKS Nodes | 2 × t3.medium | ~$28 |
-| RDS PostgreSQL | db.t3.micro Multi-AZ | ~$55 |
-| NAT Gateways | 2 × ap-south-1 (data ~50 GB/mo) | ~$65 |
-| ALB | 1 internet-facing | ~$18 |
-| ECR | 5 repos (~5 GB storage) | ~$5 |
-| Secrets Manager | 6 secrets | ~$3 |
-| CloudWatch | Logs + metrics + alarms | ~$10 |
-| VPC Endpoints | 8 interface endpoints | ~$50 |
-| KMS | 5 CMKs + API calls | ~$8 |
-| S3 | State + logs | ~$3 |
-| Lambda (FinOps) | Daily runs | <$1 |
-| **Total (fixed)** | | **~$319/month** |
-| **Bedrock (Nova Pro)** | Usage-based (est. 100K requests) | ~$0–$50/month |
+| Component | Configuration |
+|-----------|---------------|
+| EKS control plane | managed (~$73/mo) |
+| Baseline nodes | 2 × t3.small + Karpenter (spot-preferred) dynamic capacity |
+| RDS | db.t3.micro (single-AZ by default) |
+| NAT Gateways | 2 (largest variable cost; mitigated by VPC endpoints) |
+| VPC interface endpoints | 6 interface + 2 gateway |
+| Bedrock | usage-based (Nova Pro tokens) |
 
-> Costs are estimates for low-traffic production workloads. Heavy traffic increases NAT Gateway
-> data transfer costs and Bedrock token costs. Reserved Instances for EKS nodes and RDS can reduce
-> costs by 30–40%.
+> Karpenter prefers spot, consolidates aggressively, and uses larger instances
+> for pod density. KEDA scale-to-zero removes idle `ai-worker` cost.
 
 ---
 
 ## Observability Architecture
 
-### Three Pillars
+**In-cluster metrics** → `kube-prometheus-stack` (Prometheus + Grafana), deployed
+via the `monitoring` ArgoCD Application. Each service Helm chart ships a
+`ServiceMonitor` so Prometheus scrapes it; Grafana is exposed via
+`monitoring/grafana-route.yaml`. `metrics-server` provides resource metrics for
+HPA.
 
-**Logs** → CloudWatch Logs
-- `/aws/eks/ai-travel-prod/cluster` — EKS control plane
-- `/aws/eks/ai-travel-prod/application` — Application pod logs (via Fluent Bit DaemonSet)
-- `/aws/lambda/ai-travel-finops-prod` — FinOps Lambda
-- `ai-travel-alb-access-logs` — ALB access logs (S3)
+**AWS-side** → CloudWatch logs/metrics with SNS alarm notifications to the
+configured `alert_email` (`modules/monitoring`). Log retention is 7 days
+(`log_retention_days`).
 
-**Metrics** → CloudWatch Metrics
-- EKS: CPU, memory, pod counts via Container Insights
-- RDS: CPU, connections, storage, IOPS via Enhanced Monitoring
-- ALB: RequestCount, TargetResponseTime, HTTPCode_ELB_5XX
-- Custom: Application-level metrics (request latency, error rate)
-
-**Traces** → AWS X-Ray (optional, disabled by default)
-- Distributed tracing across microservices
-- Enable via `XRAY_ENABLED=true` environment variable
-
-### CloudWatch Alarms
-
-| Alarm | Threshold | Action |
-|-------|-----------|--------|
-| EKS node CPU | > 80% for 5 min | SNS → PagerDuty |
-| RDS CPU | > 85% for 5 min | SNS → PagerDuty |
-| RDS storage | < 20% free | SNS → PagerDuty |
-| ALB 5xx errors | > 10/min | SNS → Slack |
-| Pod restart rate | > 3 restarts/15 min | SNS → Slack |
-| FinOps cost anomaly | > 15% vs 7-day avg | SNS → email |
+**Cost monitoring** → FinOps Lambda (daily/scheduled) with email reports
+(`modules/finops`).
