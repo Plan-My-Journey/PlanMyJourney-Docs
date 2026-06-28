@@ -206,12 +206,11 @@ CPU utilization metrics provided by `metrics-server`.
 
 | Service | Min Replicas | Max Replicas | CPU Target |
 |---------|-------------|-------------|-----------|
-| `user-service` | 2 | 5 | 70% |
-| `travel-service` | 2 | 5 | 70% |
 | `ai-service` | 2 | 5 | 70% |
-| `utility-service` | 2 | 5 | 70% |
-| `ai-worker` | 1 | 5 | 70% |
 | `frontend` | 2 | 10 | 60% (CPU) + 70% (Memory) |
+
+`user-service`, `travel-service`, `utility-service`, and `ai-worker` use a fixed
+`replicaCount` and are scaled manually via GitOps.
 
 HPAs use `autoscaling/v2` with explicit scale-up/scale-down behavior policies for
 production-grade stability (5-minute scale-down stabilization window).

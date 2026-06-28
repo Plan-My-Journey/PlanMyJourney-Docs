@@ -24,20 +24,16 @@ The general scaling philosophy:
 
 | Service | Min Replicas | Max Replicas | CPU Target | Notes |
 |---------|-------------|-------------|-----------|-------|
-| `user-service` | 2 | 5 | 70% | DB-bound, check connection pool |
-| `travel-service` | 2 | 5 | 70% | DB-bound |
 | `ai-service` | 2 | 5 | 70% | Bedrock calls are slow (2–5s), I/O-bound |
-| `utility-service` | 2 | 5 | 70% | External API rate limits apply |
-| `ai-worker` | 1 | 5 | 70% | SQS consumer; min 1 ensures queue is always drained |
 | `frontend` | 2 | 10 | 60% CPU + 70% Memory | nginx static serving |
 
 > **Note on `ai-service`:** Bedrock Nova Pro responses typically take 2–5 seconds. The service
 > is I/O-bound during that wait. CPU utilization is a reasonable proxy — it rises as the thread
 > pool fills up with in-flight requests. Keep an eye on latency during peak loads.
 
-> **Note on `ai-worker`:** The worker polls SQS continuously. Its minimum replica count is 1
-> (not 0) so the queue is always being consumed. It scales up under CPU pressure as processing
-> throughput increases.
+`user-service`, `travel-service`, `utility-service`, and `ai-worker` run at a fixed
+`replicaCount: 2` (worker: 1) defined in their `values.yaml`. Scale them manually
+with `kubectl scale` or by updating `replicaCount` in the GitOps repo.
 
 ### How HPA Works — Timeline
 
