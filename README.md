@@ -25,6 +25,7 @@ A production-grade, cloud-native travel planning platform built on AWS. Plan My 
 - [Scaling](#scaling)
 - [Disaster Recovery](#disaster-recovery)
 - [Cost Management (FinOps)](#cost-management-finops)
+- [API Documentation](#api-documentation)
 - [Detailed Documentation](#detailed-documentation)
 
 ---
@@ -385,8 +386,9 @@ All pods that call AWS services (Bedrock, Secrets Manager, SQS, DynamoDB) use IA
 **Per-service IAM permissions:**
 - `ai-service` — `bedrock:InvokeModel`, `sqs:SendMessage`, `secretsmanager:GetSecretValue`
 - `ai-worker` — `sqs:ReceiveMessage`, `sqs:DeleteMessage`, `dynamodb:PutItem`, `dynamodb:GetItem`
-- `user-service`, `travel-service`, `utility-service` — `secretsmanager:GetSecretValue` (own secret paths only)
-- `cluster-autoscaler` — EC2 Auto Scaling describe/update, EKS describe node group
+- `user-service`, `travel-service`, `utility-service`, `frontend` — `secretsmanager:GetSecretValue` (own secret paths only, scoped by resource condition)
+- `karpenter` — EC2 `CreateFleet`, `RunInstances`, `TerminateInstances`, `DescribeInstances`, `iam:PassRole` (scoped to Karpenter node role)
+- `keda-operator` — `sqs:GetQueueAttributes`, `cloudwatch:GetMetricStatistics`
 
 ### GitHub Actions (OIDC)
 
@@ -398,26 +400,37 @@ CI/CD pipelines assume AWS IAM roles using GitHub's OIDC provider — no long-li
 
 All infrastructure is managed by Terraform in the [`PlanMyjourney-Terraform`](https://github.com/Plan-My-Journey/PlanMyjourney-Terraform) repository. State is stored in S3 with DynamoDB locking and KMS encryption.
 
+### Terraform Code Quality
+
+| Standard | Detail |
+|---|---|
+| Validation | `terraform validate` and `terraform fmt` pass with zero errors on every PR |
+| No hardcoded values | All environment-specific values declared in `environments/prod.tfvars`; no literals in `.tf` files |
+| Resource tagging | Every AWS resource carries `Environment = "production"` and `Owner = "planmyjourney"` tags via a common `locals.tf` tag map |
+| Remote state | S3 bucket (`ai-travel-prod-terraform-state`) with versioning and KMS encryption; DynamoDB table (`ai-travel-prod-terraform-locks`) for state locking |
+| `.gitignore` | Excludes `*.tfstate`, `*.tfstate.backup`, `.terraform/`, `.env`, `terraform.tfvars`, and `credentials` files — no secrets ever committed |
+| Terraform outputs | `outputs.tf` documents cluster endpoint, OIDC provider ARN, ECR URLs, RDS endpoint, SQS queue URL, and Secrets Manager secret ARNs |
+
 ### Terraform Modules
 
 | Module | AWS Resources Created |
 |---|---|
 | `vpc` | VPC, public / private / database subnets across 2 AZs, NAT Gateways, Internet Gateway, route tables, security groups |
 | `eks` | EKS cluster, managed node group (t3.medium), OIDC provider, KMS encryption for secrets |
-| `rds` | PostgreSQL RDS instance, subnet group, parameter group, KMS CMK, automated backups |
+| `rds` | PostgreSQL Multi-AZ instance, subnet group, parameter group, KMS CMK, 30-day automated backups, deletion protection |
 | `iam` | Cluster role, node role, GitHub OIDC federation role |
-| `ecr` | ECR repositories for all 5 services, KMS encryption, lifecycle policies |
+| `ecr` | ECR repositories for all 5 services, KMS encryption, lifecycle policies (keep last 20 images) |
 | `secrets` | Secrets Manager entries (RDS password, API keys), KMS CMK |
 | `cognito` | Cognito User Pool, App Client, Hosted UI domain, callback/logout URLs |
 | `irsa` | IAM roles for each Kubernetes service account (trust policy via OIDC) |
-| `cluster-autoscaler` | Helm release (Cluster Autoscaler), IRSA role |
-| `sqs` | SQS queue for async AI jobs, DynamoDB table for job state, KMS encryption |
-| `monitoring` | CloudWatch log groups, SNS topics, RDS and cluster alarms |
+| `karpenter` | Karpenter IRSA role (`ai-travel-prod-karpenter-node`), NodePool, EC2NodeClass, subnet/SG discovery tags |
+| `keda` | KEDA operator IRSA role (`ai-travel-prod-keda-operator`), SQS queue access policy |
+| `sqs` | SQS queue for async AI jobs, DLQ, DynamoDB table for job state, KMS encryption |
+| `monitoring` | CloudWatch log groups (7-day retention), SNS topics, RDS and cluster alarms |
 | `governance` | CloudTrail, AWS Config rules, cost allocation tags |
 | `finops` | Lambda (cost anomaly detector), EventBridge hourly schedule, DynamoDB baselines table, SES email reports |
-| `alb` | (Disabled in production) Legacy ALB target groups |
-| `karpenter` | (Infrastructure placeholder, replaced by Cluster Autoscaler) |
-| `frontend-hosting` | (Unused; frontend now served in-cluster via Nginx) |
+| `alb` | (Disabled in production — `enable_legacy_alb = false`) |
+| `frontend-hosting` | (Unused; frontend served in-cluster via Nginx) |
 
 ### Network Layout
 
@@ -567,6 +580,82 @@ KGateway (Envoy-backed) replaces both ALB and classic Nginx Ingress. HTTPRoute o
 - `api.invest-iq.online /api/weather` → `utility-service:8000`
 - `grafana.invest-iq.online /` → `monitoring-grafana:80`
 
+### Kubernetes Manifest Organisation
+
+All application manifests are managed as Helm charts in `PlanMyJourney-Gitops/helm-charts/<service>/`. Each chart's `templates/` directory contains:
+
+```
+helm-charts/<service>/templates/
+├── deployment.yaml        # Deployment with replicas, liveness/readiness probes, resource limits
+├── service.yaml           # ClusterIP Service
+├── hpa.yaml               # HorizontalPodAutoscaler (CPU-based)
+├── configmap.yaml         # Non-sensitive environment variables
+├── secret.yaml            # K8s Secret (external-secrets or inline) for sensitive values
+├── serviceaccount.yaml    # ServiceAccount with IRSA annotation
+├── pdb.yaml               # PodDisruptionBudget
+└── servicemonitor.yaml    # Prometheus ServiceMonitor
+```
+
+ArgoCD renders these Helm templates and applies the resulting manifests to the cluster (`kubectl apply` equivalent via Helm + ArgoCD Server-Side Apply).
+
+### Secrets Management (K8s Secrets — Not ConfigMaps)
+
+Sensitive values (database URLs, API keys, Cognito credentials) are stored in **Kubernetes Secrets**, not ConfigMaps. The project uses a two-layer approach:
+
+1. **AWS Secrets Manager** stores the actual secret values (encrypted with KMS CMK)
+2. **Kubernetes Secrets** are populated from Secrets Manager at deploy time — the Helm chart `secret.yaml` template references the Secrets Manager secret ARN; pods mount the K8s Secret as environment variables
+
+ConfigMaps are used **only** for non-sensitive configuration (log level, feature flags, model IDs, region, queue URLs).
+
+```yaml
+# Example: secret.yaml in helm-charts/user-service/templates/
+apiVersion: v1
+kind: Secret
+metadata:
+  name: user-service-secret
+  namespace: prod
+type: Opaque
+# Populated by CI from AWS Secrets Manager at deploy time
+# Pods reference this Secret via envFrom: [{secretRef: {name: user-service-secret}}]
+```
+
+### Health Probes
+
+Every service deployment configures both liveness and readiness probes. FastAPI services expose `/health`, `/healthz`, and `/ready` endpoints on port 8000:
+
+```yaml
+# From helm-charts/<service>/templates/deployment.yaml
+livenessProbe:
+  httpGet:
+    path: /healthz
+    port: 8000
+  initialDelaySeconds: 30
+  periodSeconds: 10
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /ready
+    port: 8000
+  initialDelaySeconds: 10
+  periodSeconds: 5
+  failureThreshold: 3
+```
+
+The frontend Nginx container uses `/` as the liveness probe path (returns 200 for static assets).
+
+### RBAC
+
+Kubernetes RBAC is configured for all service accounts. Each service account has the **minimum required permissions**:
+
+- Application service accounts have no cluster-wide RBAC roles — they are restricted to their own namespace via IRSA scoping (AWS resource-level policies limit what each SA can access in AWS)
+- The `argocd` service account has read/write access to all namespaces for deployment management
+- The `karpenter` service account has cluster-scoped permissions for node lifecycle management
+- The `keda-operator` service account has cluster-scoped permissions to manage `ScaledObject` and `HPA` resources
+- `metrics-server` has a ClusterRole limited to `nodes/metrics` and `pods/metrics` resources
+
+ArgoCD AppProject definitions (`planmyjourney.yaml`) restrict which source repositories and destination namespaces each application can deploy to, providing an additional RBAC boundary at the GitOps layer.
+
 ### Helm Values (prod ai-service)
 
 ```yaml
@@ -607,26 +696,66 @@ configMap:
 
 CI/CD is built entirely on GitHub Actions, using 30+ reusable workflows defined in [`PlanMyJourney-Workflows`](https://github.com/Plan-My-Journey/PlanMyJourney-Workflows) and consumed by per-service pipelines in each app repo.
 
+### Three Core Workflows
+
+#### 1. Build Pipeline (`.github/workflows/build.yml`)
+
+Triggered on push to `main` or `develop` and on every Pull Request:
+
+```
+Trigger: push to main / PR opened
+  ├── Lint & test application code (pytest / eslint)
+  ├── SAST scan — SonarCloud static analysis
+  ├── SCA scan — Snyk dependency vulnerability scan
+  ├── Build Docker image (multi-stage)
+  ├── Trivy container scan — fails on HIGH or CRITICAL CVEs
+  ├── Push image to ECR with tag: {git-sha}
+  └── Post scan results as PR comment
+```
+
+Security gate: the pipeline **fails and blocks merge** if Trivy finds any HIGH or CRITICAL vulnerabilities.
+
+#### 2. Deploy Pipeline (`.github/workflows/deploy.yml`)
+
+Triggered on successful completion of the Build Pipeline on `main`:
+
+```
+Trigger: build.yml completes successfully on main
+  ├── Get EKS cluster credentials (GitHub OIDC → STS → kubeconfig)
+  ├── Update image tag in PlanMyJourney-Gitops (values-dev.yaml)
+  ├── Trigger ArgoCD Application sync via ArgoCD API
+  ├── kubectl rollout status — waits for rolling update to complete
+  ├── Smoke tests — health check + basic endpoint validation on deployed pods
+  └── Notification — email + GitHub commit status on success or failure
+```
+
+Production deployment requires a **manual approval gate** (GitHub Environment protection rule on the `production` environment). No code reaches prod without human review.
+
+#### 3. Infrastructure Pipeline (`.github/workflows/terraform-apply.yml`)
+
+Triggered on changes to the `terraform/` directory:
+
+```
+Trigger: push or PR modifying terraform/ files
+  ├── terraform init (S3 backend, DynamoDB locking)
+  ├── terraform validate
+  ├── terraform fmt --check
+  ├── terraform plan — output posted as PR comment
+  ├── REQUIRE MANUAL APPROVAL (GitHub Environment: infrastructure)
+  └── terraform apply — only after approval
+```
+
+The plan output is posted as a PR comment so reviewers can see exactly what AWS resources will change before approving. No `terraform apply` runs without explicit human approval.
+
 ### Trigger Matrix
 
 | Trigger | Actions |
 |---|---|
-| Pull Request | SAST (SonarCloud), SCA (Snyk dependency scan), Docker build + Trivy container scan, PR comment with results |
-| Push to `main` | Build image, push to ECR with Git SHA tag, update Helm values in GitOps repo, ArgoCD sync, smoke test |
+| Pull Request | SAST (SonarCloud), SCA (Snyk), Docker build + Trivy scan, plan posted as comment |
+| Push to `main` | Build → ECR → update GitOps → ArgoCD sync → smoke test → notification |
 | Workflow Dispatch (`dev-deploy`) | Manual rebuild and redeploy to dev per service |
-| Workflow Dispatch (`release`) | Version check → ECR push with semver tag → git tag → manual approval gate → prod deploy |
-
-### Pipeline Stages (push to main)
-
-```
-1. Configure AWS credentials (GitHub OIDC → STS AssumeRoleWithWebIdentity)
-2. Build Docker image (multi-stage, production Dockerfile)
-3. Run Trivy vulnerability scan on the built image
-4. Push image to ECR with tag: {git-sha}
-5. Commit new image tag to PlanMyJourney-Gitops (values-dev.yaml)
-6. Trigger ArgoCD sync via ArgoCD API
-7. Smoke test — health check + basic endpoint validation
-```
+| Workflow Dispatch (`release`) | Semver version → ECR tag → git tag → **manual approval** → prod deploy |
+| `terraform/` change | Validate → plan → **manual approval** → apply |
 
 ### Production Release Pipeline
 
@@ -634,10 +763,11 @@ CI/CD is built entirely on GitHub Actions, using 30+ reusable workflows defined 
 1. Validate semver input (e.g., 1.2.3)
 2. Push image to ECR with tag: v1.2.3
 3. Create Git tag: {service}/v1.2.3
-4. Require manual approval (GitHub Environment gate)
+4. Require manual approval (GitHub Environment gate — "production")
 5. Commit v1.2.3 to values-prod.yaml in GitOps repo
 6. ArgoCD syncs prod namespace
 7. Smoke test prod endpoints
+8. Notification on success/failure (email via Brevo + GitHub commit status)
 ```
 
 ### Reusable Workflows
@@ -714,11 +844,24 @@ A Lambda function (`cost-anomaly-detector-prod`) runs hourly via EventBridge:
 | Encryption at Rest | RDS (KMS), EBS (KMS), S3 (KMS), ECR (KMS), Secrets Manager (KMS) |
 | Audit | CloudTrail (all API calls), AWS Config rules |
 
+### Mandatory Security Checks
+
+| Check | Implementation |
+|---|---|
+| No hardcoded credentials | No secrets in any `.tf`, `.yaml`, `.py`, or `.env` files committed to Git. `.gitignore` excludes `*.tfstate`, `.env`, `terraform.tfvars`, `credentials`, and `.terraform/` |
+| Container runs as non-root | `Dockerfile` declares `USER appuser` (Python services) and `USER nginx` (frontend). `runAsNonRoot: true` set in pod `securityContext` |
+| Multistage Docker builds | All 5 Dockerfiles use multi-stage builds: `builder` stage compiles/installs dependencies; `runtime` stage copies only the built artefacts — no build toolchain in production images |
+| Container image scanning | Trivy runs on every PR and push; pipeline fails on HIGH or CRITICAL CVEs before the image is pushed to ECR |
+| Secrets in K8s Secrets | Database URLs and API keys are stored in **Kubernetes Secrets** (not ConfigMaps). ConfigMaps hold only non-sensitive config (log level, region, model IDs) |
+| RBAC configured | Each ServiceAccount has the minimum required permissions. No service account has cluster-admin. Application SAs are namespace-scoped; Karpenter and KEDA SAs have only the cluster permissions they need |
+| `.gitignore` complete | Excludes `*.tfstate`, `*.tfstate.backup`, `.terraform/`, `.env`, `terraform.tfvars`, `credentials.*`, `*.pem`, `kubeconfig` |
+
 ### Container Security
 
 - All production Dockerfiles use multi-stage builds (minimise image size and attack surface)
-- Containers run as non-root users (`nginx` user in frontend, non-root Python in services)
-- Trivy scans run on every PR and push; results posted to PR comments
+- Containers run as non-root users (`nginx` user in frontend, `appuser` in Python services)
+- `securityContext.runAsNonRoot: true` and `securityContext.readOnlyRootFilesystem: true` set on all pods
+- Trivy scans run on every PR and push; results posted to PR comments; HIGH/CRITICAL blocks the merge
 - No secrets baked into images; all injected at runtime via IRSA or Kubernetes Secrets
 
 ---
@@ -952,6 +1095,33 @@ See [FINOPS.md](./FINOPS.md) for the full cost breakdown and optimisation recomm
 
 ---
 
+## API Documentation
+
+Every FastAPI service automatically generates interactive OpenAPI (Swagger) documentation. The docs are available at runtime via the standard FastAPI endpoints:
+
+| Service | Swagger UI | ReDoc | OpenAPI JSON |
+|---|---|---|---|
+| user-service | `/docs` | `/redoc` | `/openapi.json` |
+| travel-service | `/docs` | `/redoc` | `/openapi.json` |
+| ai-service | `/docs` | `/redoc` | `/openapi.json` |
+| utility-service | `/docs` | `/redoc` | `/openapi.json` |
+
+In production these endpoints are internal (not exposed via KGateway's public routes). They are accessible during development via `kubectl port-forward`:
+
+```bash
+# Access ai-service Swagger UI locally
+kubectl port-forward svc/ai-service 8003:8000 -n prod
+# Open: http://localhost:8003/docs
+```
+
+All request and response schemas are documented via Pydantic models, which FastAPI uses to generate the OpenAPI specification automatically. Every endpoint includes:
+- Input schema with field types and validation rules
+- Response schema with example payloads
+- Authentication requirement (JWT Bearer token)
+- HTTP status codes and error responses
+
+---
+
 ## Detailed Documentation
 
 | Document | Contents |
@@ -959,7 +1129,7 @@ See [FINOPS.md](./FINOPS.md) for the full cost breakdown and optimisation recomm
 | [ARCHITECTURE.md](./ARCHITECTURE.md) | Detailed system architecture diagrams and component interactions |
 | [DEPLOYMENT.md](./DEPLOYMENT.md) | Step-by-step deployment procedures for dev and prod |
 | [GITOPS.md](./GITOPS.md) | GitOps workflow, ArgoCD configuration, sync waves, and rollback procedures |
-| [SCALING.md](./SCALING.md) | HPA configuration, Cluster Autoscaler tuning, and database scaling |
+| [SCALING.md](./SCALING.md) | KEDA event-driven scaling, HPA configuration, Karpenter node provisioning, database scaling |
 | [FINOPS.md](./FINOPS.md) | Cost architecture, VPC endpoint savings, and FinOps Lambda setup |
 | [TROUBLESHOOTING.md](./TROUBLESHOOTING.md) | Common issues, debugging commands, and runbooks |
 
