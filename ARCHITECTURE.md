@@ -159,7 +159,7 @@ in the same AZ. Database route tables have **no** `0.0.0.0/0` route (no internet
 | Parameter | Value |
 |-----------|-------|
 | Cluster name | `ai-travel-prod` |
-| Kubernetes version | 1.30 |
+| Kubernetes version | 1.34 |
 | OIDC provider | Enabled (required for IRSA) |
 | Worker placement | Private subnets only |
 
