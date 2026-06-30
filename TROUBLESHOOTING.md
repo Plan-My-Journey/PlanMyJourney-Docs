@@ -1,7 +1,6 @@
-# Troubleshooting Guide
+# Plan My Journey — Troubleshooting Guide
 
-This guide covers the most common issues encountered when operating the AI-Travel-Planner
-platform on EKS. Start with the Quick Diagnostics section before diving into specific issues.
+This guide covers the most common issues encountered when operating the Plan My Journey platform on EKS. Start with Quick Diagnostics before diving into specific issues.
 
 ---
 
@@ -12,32 +11,37 @@ Run these commands first to get a holistic view of the system state:
 ```bash
 # Overall node health
 kubectl get nodes
-# Expected: All nodes STATUS=Ready
 
 # All unhealthy pods (anything not Running or Completed)
 kubectl get pods -A | grep -v -E "Running|Completed"
 
 # Application pods specifically
-kubectl get pods -n ai-travel
+kubectl get pods -n prod
 kubectl get pods -n argocd
 kubectl get pods -n kube-system
+kubectl get pods -n karpenter
+kubectl get pods -n keda
 
 # Recent events (warnings and errors)
-kubectl get events -n ai-travel --sort-by='.lastTimestamp' | tail -30
+kubectl get events -n prod --sort-by='.lastTimestamp' | tail -30
 
 # ArgoCD application health
 kubectl get applications -n argocd
-# Or via CLI:
-argocd app list
 
-# Ingress status (is there an ALB address?)
-kubectl get ingress -n ai-travel
+# Gateway status (is traffic routing?)
+kubectl get gateway -n kgateway-system
+kubectl get httproutes -n prod
 
-# HPA scaling status
-kubectl get hpa -n ai-travel
+# HPA and KEDA scaling status
+kubectl get hpa -n prod
+kubectl get scaledobjects -n prod
 
-# Recent logs for a crashing pod
-kubectl logs <pod-name> -n ai-travel --tail=100 --previous
+# Karpenter node provisioning
+kubectl get nodepools
+kubectl get nodeclaims
+
+# Recent pod logs for a crashing pod
+kubectl logs <pod-name> -n prod --tail=100 --previous
 ```
 
 ---
@@ -50,115 +54,94 @@ kubectl logs <pod-name> -n ai-travel --tail=100 --previous
 
 ```bash
 # Step 1: Identify which pod is crashing
-kubectl get pods -n ai-travel | grep -v Running
+kubectl get pods -n prod | grep -v Running
 
-# Step 2: Check current logs (may be empty if container didn't start)
-kubectl logs <pod-name> -n ai-travel
+# Step 2: Check logs from the PREVIOUS run (before last crash)
+kubectl logs <pod-name> -n prod --previous
 
-# Step 3: Check logs from the PREVIOUS run (before last crash)
-kubectl logs <pod-name> -n ai-travel --previous
-
-# Step 4: Describe pod for events and state
-kubectl describe pod <pod-name> -n ai-travel
+# Step 3: Describe pod for events and state
+kubectl describe pod <pod-name> -n prod
 # Look for: Last State, Exit Code, Events section
-
-# Step 5: Check if the container can start at all
-kubectl run debug --image=<same-image> --rm -it --restart=Never -n ai-travel -- /bin/bash
 ```
 
 **Common Causes and Fixes:**
 
 | Exit Code | Likely Cause | Fix |
-|-----------|-------------|-----|
+|---|---|---|
 | 1 | Application error at startup (Python traceback) | Check logs — usually missing env var or failed DB connection |
-| 137 | OOMKilled (out of memory) | Increase memory limits in Helm values |
-| 139 | Segmentation fault | Usually a bad native library — rebuild image |
-| 2 | Shell/entrypoint script error | Check Dockerfile CMD/ENTRYPOINT |
+| 137 | OOMKilled | Increase memory limits in `values-prod.yaml` |
+| 139 | Segmentation fault | Rebuild image |
+| 2 | Shell/entrypoint script error | Check Dockerfile `CMD`/`ENTRYPOINT` |
 
-**Missing secret causes CrashLoop:**
+**Missing secret from Secrets Manager:**
 
 ```bash
-# Check if secrets CSI driver mounted the secret correctly
-kubectl describe pod <pod-name> -n ai-travel | grep -A 5 "Mounts:"
-
-# Verify secret exists in Secrets Manager
+# Verify the secret exists
 aws secretsmanager describe-secret \
-  --secret-id "ai-travel/database-url" \
-  --region ap-south-1
+  --secret-id "ai-travel-prod/user-service" \
+  --region us-east-1
 
-# Check SecretProviderClass is correct
-kubectl get secretproviderclass -n ai-travel
-kubectl describe secretproviderclass <name> -n ai-travel
+# Check the pod's environment variables (secrets are injected as env vars via IRSA)
+kubectl exec -it <pod-name> -n prod -- env | grep -E "DATABASE|SECRET|COGNITO"
 ```
 
 ---
 
 ## Issue 2: ImagePullBackOff / ErrImagePull
 
-**Symptom:** Pod status shows `ImagePullBackOff` or `ErrImagePull` — Kubernetes cannot pull the container image.
+**Symptom:** Pod status shows `ImagePullBackOff` — Kubernetes cannot pull the container image.
 
 **Diagnosis:**
 
 ```bash
-# Check the error message
-kubectl describe pod <pod-name> -n ai-travel | grep -A 10 "Events:"
+kubectl describe pod <pod-name> -n prod | grep -A 10 "Events:"
 # Look for: "Failed to pull image" or "unauthorized: authentication required"
 ```
 
 **Fix A: ECR image does not exist**
 
 ```bash
-# Verify the image tag exists in ECR
-IMAGE_TAG=$(kubectl get pod <pod-name> -n ai-travel \
+IMAGE_TAG=$(kubectl get pod <pod-name> -n prod \
   -o jsonpath='{.spec.containers[0].image}' | cut -d: -f2)
-echo "Looking for tag: $IMAGE_TAG"
 
 aws ecr describe-images \
-  --repository-name ai-travel/user-service \
-  --region ap-south-1 \
+  --repository-name planmyjourney/user-service \
+  --region us-east-1 \
   --image-ids imageTag=$IMAGE_TAG
-
-# If not found: trigger a new CI build OR manually push:
-docker pull user-service:latest
-docker tag user-service:latest \
-  ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/ai-travel/user-service:$IMAGE_TAG
-docker push ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/ai-travel/user-service:$IMAGE_TAG
 ```
 
-**Fix B: IRSA permissions missing for ECR pull**
+If not found, trigger a new CI build or update `image.tag` in `values-prod.yaml` to a valid SHA.
+
+**Fix B: Node IAM role missing ECR pull permissions**
 
 ```bash
-# Verify the node IAM role has ECR pull permissions
-# EKS nodes pull images using the EC2 instance profile, NOT IRSA
+# EKS nodes pull images using the EC2 instance profile
 aws iam list-attached-role-policies \
-  --role-name ai-travel-eks-node-role \
+  --role-name ai-travel-prod-eks-node-role \
   --query "AttachedPolicies[].PolicyArn"
 # Must include: arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
 
-# If missing: attach the policy
+# If missing:
 aws iam attach-role-policy \
-  --role-name ai-travel-eks-node-role \
+  --role-name ai-travel-prod-eks-node-role \
   --policy-arn arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
 ```
 
 **Fix C: Wrong AWS region in image URL**
 
 ```bash
-# Image URL must use the same region as the cluster
-kubectl get pod <pod-name> -n ai-travel \
-  -o jsonpath='{.spec.containers[0].image}'
-# Correct: ACCOUNT.dkr.ecr.ap-south-1.amazonaws.com/...
-# Wrong:   ACCOUNT.dkr.ecr.us-east-1.amazonaws.com/...  ← wrong region
-
-# Fix: update image.repository in Helm values and sync ArgoCD
+kubectl get pod <pod-name> -n prod -o jsonpath='{.spec.containers[0].image}'
+# Correct: <account>.dkr.ecr.us-east-1.amazonaws.com/planmyjourney/...
+# Wrong:   <account>.dkr.ecr.ap-south-1.amazonaws.com/...
 ```
+
+Fix by updating `image.repository` in `values-prod.yaml` and pushing to the GitOps repo.
 
 ---
 
 ## Issue 3: Database Connection Errors
 
-**Symptom:** Service pods crash with `Connection refused`, `FATAL: password authentication failed`,
-or `could not connect to server` errors.
+**Symptom:** Service pods crash with `Connection refused`, `FATAL: password authentication failed`, or `could not connect to server`.
 
 **Diagnosis:**
 
@@ -166,165 +149,114 @@ or `could not connect to server` errors.
 # Check RDS instance status
 aws rds describe-db-instances \
   --db-instance-identifier ai-travel-prod \
-  --region ap-south-1 \
+  --region us-east-1 \
   --query "DBInstances[0].{Status: DBInstanceStatus, Endpoint: Endpoint.Address}"
 
 # Test connectivity from within the cluster
 kubectl run pg-test \
-  --image=postgres:15 \
+  --image=postgres \
   --rm -it \
   --restart=Never \
-  -n ai-travel \
+  -n prod \
   -- psql -h <rds-endpoint> -U postgres -d user_db -c "SELECT 1"
-
-# Check if DATABASE_URL secret is correctly set
-aws secretsmanager get-secret-value \
-  --secret-id "ai-travel/database-url" \
-  --region ap-south-1 \
-  --query "SecretString" \
-  --output text
 ```
 
-**Fix A: RDS Security Group not allowing EKS pods**
+**Fix A: RDS Security Group not allowing EKS traffic**
 
 ```bash
-# Get EKS node security group ID
 EKS_NODE_SG=$(aws eks describe-cluster \
   --name ai-travel-prod \
-  --region ap-south-1 \
+  --region us-east-1 \
   --query "cluster.resourcesVpcConfig.clusterSecurityGroupId" \
   --output text)
 
-# Get RDS security group ID
 RDS_SG=$(aws rds describe-db-instances \
   --db-instance-identifier ai-travel-prod \
-  --region ap-south-1 \
+  --region us-east-1 \
   --query "DBInstances[0].VpcSecurityGroups[0].VpcSecurityGroupId" \
   --output text)
 
-# Verify rule exists: EKS nodes → RDS port 5432
+# Verify port 5432 rule exists
 aws ec2 describe-security-groups \
   --group-ids $RDS_SG \
   --query "SecurityGroups[0].IpPermissions[?FromPort==\`5432\`]"
 
-# If missing: add the rule
+# If missing:
 aws ec2 authorize-security-group-ingress \
   --group-id $RDS_SG \
-  --protocol tcp \
-  --port 5432 \
+  --protocol tcp --port 5432 \
   --source-group $EKS_NODE_SG \
-  --region ap-south-1
+  --region us-east-1
 ```
 
 **Fix B: Alembic migration failure on pod startup**
 
 ```bash
-# Check migration logs
-kubectl logs <pod-name> -n ai-travel | grep -i alembic
+kubectl logs <pod-name> -n prod | grep -i alembic
 
-# Run migration manually from within pod
-kubectl exec -it <pod-name> -n ai-travel -- \
-  alembic upgrade head
-
-# Reset migrations (CAUTION: data loss in development only)
-kubectl exec -it <pod-name> -n ai-travel -- \
-  alembic downgrade base
-kubectl exec -it <pod-name> -n ai-travel -- \
-  alembic upgrade head
+# Run migration manually inside the pod
+kubectl exec -it <pod-name> -n prod -- alembic upgrade head
 ```
 
 **Fix C: Too many connections to RDS**
 
 ```bash
 # Check current connection count
-kubectl exec -it <pod-name> -n ai-travel -- \
+kubectl exec -it <pod-name> -n prod -- \
   psql $DATABASE_URL -c "SELECT count(*) FROM pg_stat_activity;"
 
-# If near max (87 for db.t3.micro): scale down replicas temporarily
-kubectl scale deployment user-service --replicas=1 -n ai-travel
+# Temporarily reduce replicas
+kubectl scale deployment user-service --replicas=1 -n prod
 
-# Long-term: add PgBouncer or reduce pool_size in SQLAlchemy config
+# Long-term: reduce pool_size in SQLAlchemy config or upgrade RDS instance class
 ```
 
 ---
 
 ## Issue 4: Bedrock Permission Denied (ai-service)
 
-**Symptom:** `ai-service` logs show `AccessDeniedException` when calling Bedrock, or
-`ai-service` returns static fallback responses instead of AI-generated content.
+**Symptom:** `ai-service` logs show `AccessDeniedException` or return static fallback responses instead of AI-generated itineraries.
 
 **Diagnosis:**
 
 ```bash
 # Check ai-service logs for Bedrock errors
-kubectl logs -l app=ai-service -n ai-travel --tail=50 | grep -i bedrock
+kubectl logs -l app.kubernetes.io/name=ai-service -n prod --tail=50 | grep -i -E "bedrock|access|denied|error"
 
 # Verify IRSA is attached to the pod
-kubectl get pod <ai-service-pod> -n ai-travel \
-  -o jsonpath='{.spec.serviceAccountName}'
-# Should be: ai-service-sa
-
-kubectl get serviceaccount ai-service-sa -n ai-travel -o yaml
+kubectl get serviceaccount ai-service-sa -n prod -o yaml
 # Should have annotation: eks.amazonaws.com/role-arn: arn:aws:iam::...
+
+# Check which environment variables the pod sees
+kubectl exec -it <ai-service-pod> -n prod -- env | grep -E "BEDROCK|AWS"
 ```
 
 **Fix A: Bedrock model access not enabled**
 
-1. Go to [AWS Console → Bedrock → Model access](https://console.aws.amazon.com/bedrock/home?region=ap-south-1#/modelaccess) in `ap-south-1`
+1. Go to AWS Console → Bedrock → Model access in `us-east-1`
 2. Find **Amazon Nova Pro** (`amazon.nova-pro-v1:0`)
-3. Status must be **Access granted** (not "Available to request")
-4. If not granted: click **Manage model access** → check Nova Pro → Submit
+3. Status must be **Access granted** — if not, click **Manage model access** → enable Nova Pro → Submit
 
 **Fix B: IRSA role missing bedrock:InvokeModel permission**
 
 ```bash
-# Get the IRSA role ARN for ai-service
-ROLE_ARN=$(kubectl get serviceaccount ai-service-sa -n ai-travel \
+ROLE_ARN=$(kubectl get serviceaccount ai-service-sa -n prod \
   -o jsonpath='{.metadata.annotations.eks\.amazonaws\.com/role-arn}')
 echo $ROLE_ARN
 
-# Check the role's policies
-aws iam list-role-policies --role-name ai-travel-ai-service
-aws iam get-role-policy \
-  --role-name ai-travel-ai-service \
-  --policy-name BedrockInvokePolicy
+aws iam list-role-policies --role-name ai-travel-prod-ai-service
+# Must include a policy with "bedrock:InvokeModel" on the Nova Pro model ARN
 
-# The policy must include:
-# {
-#   "Effect": "Allow",
-#   "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
-#   "Resource": "arn:aws:bedrock:ap-south-1::foundation-model/amazon.nova-pro-v1:0"
-# }
-
-# If wrong: fix in Terraform and apply
-cd infrastructure/terraform
+# Fix in Terraform:
 terraform apply -target=module.eks.aws_iam_role_policy.ai_service_bedrock
 ```
 
-**Fix C: Verify IRSA token is being injected**
+**Fix C: Test Bedrock access from within the pod**
 
 ```bash
-# Decode the IRSA token to verify it contains the correct role
-kubectl exec -it <ai-service-pod> -n ai-travel -- \
-  cat /var/run/secrets/eks.amazonaws.com/serviceaccount/token | \
-  python3 -c "
-import sys, base64, json
-token = sys.stdin.read().split('.')[1]
-# Add padding
-token += '=' * (4 - len(token) % 4)
-decoded = json.loads(base64.b64decode(token).decode())
-print(json.dumps(decoded, indent=2))
-"
-# Look for: "eks.amazonaws.com/serviceaccount/namespace": "ai-travel"
-# And: "sub": "system:serviceaccount:ai-travel:ai-service-sa"
-```
-
-**Fix D: Test Bedrock access from within the pod**
-
-```bash
-kubectl exec -it <ai-service-pod> -n ai-travel -- python3 -c "
+kubectl exec -it <ai-service-pod> -n prod -- python3 -c "
 import boto3, json
-client = boto3.client('bedrock-runtime', region_name='ap-south-1')
+client = boto3.client('bedrock-runtime', region_name='us-east-1')
 response = client.converse(
     modelId='amazon.nova-pro-v1:0',
     messages=[{'role': 'user', 'content': [{'text': 'Hello, are you working?'}]}]
@@ -342,168 +274,306 @@ print(response['output']['message']['content'][0]['text'])
 **Diagnosis:**
 
 ```bash
-# Check sync status
-argocd app get frontend
-argocd app get frontend --show-operation
-
-# Get the detailed sync error
-argocd app get frontend -o json | jq '.status.operationState.syncResult'
+argocd app get ai-service-prod --show-operation
+argocd app get ai-service-prod -o json | jq '.status.operationState.syncResult'
+argocd app diff ai-service-prod
 ```
 
 **Fix A: OutOfSync due to Helm defaults**
 
 ```bash
 # See what ArgoCD thinks is different
-argocd app diff frontend
+argocd app diff ai-service-prod
 
-# Common cause: Helm adds default values that aren't in your values.yaml
-# Fix: add ignoreDifferences to the Application spec:
+# Common fix: add ignoreDifferences to the Application spec for HPA-managed replicas
 # spec:
 #   ignoreDifferences:
 #   - group: apps
 #     kind: Deployment
 #     jsonPointers:
-#     - /spec/replicas    # Ignore if HPA manages replicas
+#     - /spec/replicas
 ```
 
-**Fix B: Helm rendering error (check template syntax)**
+**Fix B: Helm rendering error**
 
 ```bash
-# Reproduce locally
-helm template frontend infrastructure/helm-charts/frontend/ \
-  --values infrastructure/helm-charts/frontend/values.yaml \
+helm template ai-service helm-charts/ai-service/ \
+  --values helm-charts/ai-service/values-prod.yaml \
   --debug 2>&1 | head -50
-
-# Fix the template error and push to git
 ```
 
-**Fix C: `Namespace "ai-travel" not found`**
+Fix the template error and push to the GitOps repo.
+
+**Fix C: Namespace not found**
 
 ```bash
-# Create the namespace manually (or add CreateNamespace sync option)
-kubectl create namespace ai-travel
+kubectl create namespace prod
 
-# Add to ArgoCD app spec:
+# Or add to the Application spec:
 # syncOptions:
 #   - CreateNamespace=true
 ```
 
 ---
 
-## Issue 6: ALB Not Routing Traffic
+## Issue 6: KGateway — Traffic Not Routing
 
-**Symptom:** External URL returns connection refused or times out; ALB shows no healthy targets.
+**Symptom:** External URL returns connection refused or 502; requests are not reaching backend pods.
 
 **Diagnosis:**
 
 ```bash
-# Check if ingress has an ALB address
-kubectl get ingress -n ai-travel
-# ADDRESS column should contain the ALB DNS name
+# Check Gateway status
+kubectl get gateway -n kgateway-system
+# PROGRAMMED column should show: True
 
-# If ADDRESS is empty: ALB controller is not working
-kubectl logs -n kube-system \
-  -l app.kubernetes.io/name=aws-load-balancer-controller \
-  --tail=50
+# Check HTTPRoute status
+kubectl get httproutes -n prod
+# CONDITIONS column: ResolvedRefs=True for all routes
 
-# Check ingress annotations
-kubectl describe ingress frontend -n ai-travel
+# Check if KGateway Envoy pods are running
+kubectl get pods -n kgateway-system
 
-# Check target group health in AWS
-ALB_ARN=$(aws elbv2 describe-load-balancers \
-  --region ap-south-1 \
-  --query "LoadBalancers[?contains(LoadBalancerName,'ai-travel')].LoadBalancerArn" \
-  --output text)
-TG_ARN=$(aws elbv2 describe-target-groups \
-  --load-balancer-arn $ALB_ARN \
-  --query "TargetGroups[0].TargetGroupArn" \
-  --output text)
-aws elbv2 describe-target-health --target-group-arn $TG_ARN
+# Check NLB address (should be a DNS name)
+kubectl get gateway api-gateway -n kgateway-system \
+  -o jsonpath='{.status.addresses[0].value}'
+
+# Check KGateway controller logs
+kubectl logs -n kgateway-system \
+  -l app.kubernetes.io/name=kgateway --tail=50
 ```
 
-**Fix A: ALB controller IRSA role missing permissions**
+**Fix A: Gateway not programmed (NLB not created)**
 
 ```bash
-# The ALB controller needs specific IAM permissions
-# Verify the IRSA role is correct
-kubectl get serviceaccount aws-load-balancer-controller \
-  -n kube-system -o yaml | grep role-arn
+# Check if the gateway controller has the correct IRSA permissions
+kubectl get serviceaccount -n kgateway-system -o yaml | grep role-arn
 
-# Re-apply Terraform to ensure the IRSA role is correct
-cd infrastructure/terraform
-terraform apply -target=module.eks.module.alb_controller_irsa
+# Look for NLB creation errors in controller logs
+kubectl logs -n kgateway-system \
+  -l app.kubernetes.io/name=kgateway --tail=100 | grep -i -E "error|nlb|load balancer"
+
+# Re-sync the KGateway ArgoCD application
+argocd app sync kgateway-prod
 ```
 
-**Fix B: Missing required annotations on Ingress**
+**Fix B: HTTPRoute not resolving to backend**
 
-```yaml
-# Required annotations for ALB ingress to work:
-annotations:
-  kubernetes.io/ingress.class: alb
-  alb.ingress.kubernetes.io/scheme: internet-facing
-  alb.ingress.kubernetes.io/target-type: ip
-  alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443},{"HTTP":80}]'
-  alb.ingress.kubernetes.io/ssl-redirect: "443"
-  alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:ap-south-1:...
+```bash
+# Check if the backend service exists
+kubectl get service -n prod
+# The HTTPRoute backendRef service name must match exactly
+
+kubectl describe httproute <route-name> -n prod
+# Events section shows resolution errors
+```
+
+**Fix C: TLS certificate issue (NLB listener)**
+
+```bash
+# Verify ACM certificate is issued and in us-east-1
+aws acm list-certificates --region us-east-1 \
+  --query "CertificateSummaryList[?DomainName=='invest-iq.online']"
+
+# Check NLB listener has the correct certificate ARN
+aws elbv2 describe-listeners \
+  --load-balancer-arn <nlb-arn> \
+  --region us-east-1 \
+  --query "Listeners[?Port==\`443\`].Certificates"
+```
+
+**Fix D: Route 53 not pointing to NLB**
+
+```bash
+# Get the NLB DNS name
+NLB_DNS=$(kubectl get gateway api-gateway -n kgateway-system \
+  -o jsonpath='{.status.addresses[0].value}')
+echo $NLB_DNS
+
+# Compare with Route 53 record
+aws route53 list-resource-record-sets \
+  --hosted-zone-id <zone-id> \
+  --query "ResourceRecordSets[?Name=='invest-iq.online.']"
 ```
 
 ---
 
-## Issue 7: HPA Not Scaling
+## Issue 7: KEDA — ai-worker Not Scaling
+
+**Symptom:** SQS queue has messages but `ai-worker` pods are not starting, or KEDA is not scaling as expected.
+
+**Diagnosis:**
+
+```bash
+# Check ScaledObject status
+kubectl describe scaledobject ai-worker-scaledobject -n prod
+# Look for: "SuccessfullySet" or error messages in Events
+
+# Check KEDA operator logs
+kubectl logs -n keda -l app.kubernetes.io/name=keda-operator --tail=100
+
+# Check queue depth manually
+aws sqs get-queue-attributes \
+  --queue-url https://sqs.us-east-1.amazonaws.com/235270183260/ai-travel-prod-ai-jobs \
+  --attribute-names ApproximateNumberOfMessages \
+  --region us-east-1
+
+# Check TriggerAuthentication
+kubectl describe triggerauthentication keda-trigger-auth-aws-irsa -n prod
+```
+
+**Fix A: KEDA IRSA role missing SQS permissions**
+
+```bash
+# Get the KEDA operator's IRSA role
+kubectl get serviceaccount keda-operator -n keda -o yaml | grep role-arn
+
+# Verify it has sqs:GetQueueAttributes
+aws iam simulate-principal-policy \
+  --policy-source-arn arn:aws:iam::<account>:role/ai-travel-prod-keda-operator \
+  --action-names sqs:GetQueueAttributes \
+  --resource-arns arn:aws:sqs:us-east-1:<account>:ai-travel-prod-ai-jobs
+
+# Fix in Terraform:
+terraform apply -target=module.keda_irsa
+```
+
+**Fix B: KEDA cannot authenticate to AWS (OIDC issue)**
+
+```bash
+# Verify the KEDA operator pod's service account has the IRSA annotation
+kubectl get pod -n keda -l app.kubernetes.io/name=keda-operator \
+  -o jsonpath='{.items[0].spec.serviceAccountName}'
+# Should be: keda-operator
+
+kubectl get serviceaccount keda-operator -n keda -o yaml
+# Must have: eks.amazonaws.com/role-arn annotation
+```
+
+**Fix C: ScaledObject targeting wrong deployment**
+
+```bash
+# Verify the scaleTargetRef name matches the actual deployment name
+kubectl get scaledobject ai-worker-scaledobject -n prod \
+  -o jsonpath='{.spec.scaleTargetRef.name}'
+# Must match:
+kubectl get deployment -n prod | grep ai-worker
+```
+
+---
+
+## Issue 8: Karpenter — Nodes Not Provisioning
+
+**Symptom:** Pods remain in `Pending` state for more than 2 minutes; no new nodes appear.
+
+**Diagnosis:**
+
+```bash
+# Check Karpenter logs for provisioning attempts
+kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter --tail=100 | grep -i -E "launch|error|nodeclaim"
+
+# Check NodePool limits (has the CPU/memory ceiling been reached?)
+kubectl describe nodepool default | grep -A 20 "Status:"
+
+# Check the pending pod resource requests
+kubectl describe pod <pending-pod> -n prod | grep -A 10 "Requests:"
+
+# Check EC2 subnet tags (Karpenter discovers subnets via tags)
+aws ec2 describe-subnets \
+  --filters "Name=tag:karpenter.sh/discovery,Values=ai-travel-prod" \
+  --query 'Subnets[].SubnetId' \
+  --region us-east-1
+```
+
+**Fix A: NodePool limits reached**
+
+```bash
+# Check current usage vs limits
+kubectl describe nodepool default | grep -A 5 "Resources"
+
+# Increase limits in the NodePool manifest in PlanMyJourney-Gitops
+# platform/karpenter/nodepool.yaml
+# limits:
+#   cpu: "96"         # increased from 48
+#   memory: 192Gi
+
+# Push to Git — ArgoCD applies it
+git push origin main
+```
+
+**Fix B: No Spot capacity (instance interruption)**
+
+Karpenter automatically falls back from Spot to On-Demand when Spot capacity is unavailable. If you see `InsufficientInstanceCapacity` in Karpenter logs for all Spot types, Karpenter will provision On-Demand until Spot capacity recovers. No action needed.
+
+**Fix C: Subnet or security group discovery tags missing**
+
+```bash
+# Tags must exist on private subnets and EKS security groups:
+aws ec2 describe-subnets \
+  --filters "Name=tag:karpenter.sh/discovery,Values=ai-travel-prod" \
+  --region us-east-1
+
+# If missing, add tags via Terraform:
+resource "aws_subnet" "private" {
+  tags = {
+    "karpenter.sh/discovery" = "ai-travel-prod"
+  }
+}
+```
+
+---
+
+## Issue 9: HPA Not Scaling
 
 **Symptom:** Pods are overloaded (CPU > 90%) but HPA is not adding replicas.
 
 **Diagnosis:**
 
 ```bash
-# Check HPA status
-kubectl describe hpa user-service -n ai-travel
+kubectl describe hpa user-service -n prod
 # Look for: "unable to get metrics" or "Metrics not available"
 
-# Check if metrics-server is running
 kubectl get pods -n kube-system | grep metrics-server
-
-# Check current metrics
-kubectl top pods -n ai-travel
+kubectl top pods -n prod
 ```
 
-**Fix A: Metrics server not running**
+**Fix A: metrics-server not running**
 
 ```bash
-# Install metrics-server
-kubectl apply -f https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+# Check ArgoCD metrics-server application
+argocd app get metrics-server-prod
 
-# Verify it starts
-kubectl wait --for=condition=available deployment/metrics-server \
-  -n kube-system --timeout=60s
+# Re-sync if needed
+argocd app sync metrics-server-prod
+
+# Verify it's healthy
+kubectl rollout status deployment/metrics-server -n kube-system
 ```
 
 **Fix B: Resource requests not set on pods**
 
-HPA calculates utilization as `current_usage / requested`. If `requests` is not set, HPA cannot
-calculate a percentage and will not scale.
+HPA calculates utilization as `current_usage / requested`. If `resources.requests` is not set, HPA cannot calculate a ratio.
 
 ```yaml
-# Required in Helm values:
+# Required in values-prod.yaml:
 resources:
   requests:
-    cpu: "100m"      # HPA uses this as the baseline
-    memory: "128Mi"
+    cpu: "250m"
+    memory: "256Mi"
   limits:
-    cpu: "500m"
-    memory: "512Mi"
+    cpu: "1000m"
+    memory: "1Gi"
 ```
 
 ---
 
-## Issue 8: RDS Storage Full
+## Issue 10: RDS Storage Full
 
 **Symptom:** Application logs show `FATAL: could not write to file` or `ERROR: could not extend file`.
 
 **Diagnosis:**
 
 ```bash
-# Check current storage usage
 aws cloudwatch get-metric-statistics \
   --namespace AWS/RDS \
   --metric-name FreeStorageSpace \
@@ -512,47 +582,77 @@ aws cloudwatch get-metric-statistics \
   --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
   --period 300 \
   --statistics Average \
-  --region ap-south-1
+  --region us-east-1
 ```
 
-**Immediate Fix (< 5 minutes):**
+**Immediate Fix (no downtime for gp3):**
 
 ```bash
-# 1. Take a manual snapshot FIRST (in case the resize fails)
+# 1. Take a manual snapshot first
 aws rds create-db-snapshot \
   --db-instance-identifier ai-travel-prod \
   --db-snapshot-identifier ai-travel-emergency-$(date +%Y%m%d) \
-  --region ap-south-1
+  --region us-east-1
 
-# 2. Modify storage immediately (no downtime for gp3)
+# 2. Increase storage
 aws rds modify-db-instance \
   --db-instance-identifier ai-travel-prod \
   --allocated-storage 100 \
   --apply-immediately \
-  --region ap-south-1
-
-# 3. Verify modification is in progress
-aws rds describe-db-instances \
-  --db-instance-identifier ai-travel-prod \
-  --query "DBInstances[0].PendingModifiedValues"
+  --region us-east-1
 ```
 
 **Long-Term Fix:**
 
 ```hcl
-# Enable auto-scaling in Terraform:
-# infrastructure/terraform/modules/rds/main.tf
+# PlanMyjourney-Terraform/modules/rds/main.tf
 resource "aws_db_instance" "main" {
   max_allocated_storage = 500   # Auto-scale up to 500 GB
-  allocated_storage     = 50    # Start at 50 GB
+  allocated_storage     = 50
 }
 ```
 
 ---
 
-## Issue 9: High Monthly AWS Costs
+## Issue 11: RDS Multi-AZ Failover
 
-**Symptom:** AWS bill exceeds expected $319/month baseline.
+**Symptom:** Brief application connection errors (< 2 minutes); RDS primary is in a different AZ than expected.
+
+**Behaviour:**
+
+RDS Multi-AZ failover is fully automatic. Route 53 updates the CNAME to point to the new primary, and the standby is promoted. Applications using SQLAlchemy with `pool_pre_ping=True` reconnect automatically after the failover.
+
+**Verification:**
+
+```bash
+# Check which AZ the primary is in
+aws rds describe-db-instances \
+  --db-instance-identifier ai-travel-prod \
+  --region us-east-1 \
+  --query "DBInstances[0].{AZ: AvailabilityZone, Status: DBInstanceStatus, SecondaryAZ: SecondaryAvailabilityZone}"
+
+# Check recent RDS events (failover appears here)
+aws rds describe-events \
+  --source-identifier ai-travel-prod \
+  --source-type db-instance \
+  --duration 60 \
+  --region us-east-1
+```
+
+**If applications do not reconnect automatically:**
+
+```bash
+# Rolling restart of all services to force reconnection
+for svc in frontend user-service travel-service ai-service ai-worker utility-service; do
+  kubectl rollout restart deployment/$svc -n prod
+done
+```
+
+---
+
+## Issue 12: High Monthly AWS Costs
+
+**Symptom:** AWS bill exceeds expected monthly baseline.
 
 **Diagnosis:**
 
@@ -563,129 +663,58 @@ aws ce get-cost-and-usage \
   --granularity MONTHLY \
   --metrics BlendedCost \
   --group-by Type=DIMENSION,Key=SERVICE \
-  --region ap-south-1 \
+  --region us-east-1 \
   --query "ResultsByTime[0].Groups[].{Service: Keys[0], Cost: Metrics.BlendedCost.Amount}" \
-  --output table | sort -k4 -rn
+  --output table
 
 # Run FinOps Lambda for AI-powered recommendations
 aws lambda invoke \
   --function-name ai-travel-finops-cost-analyzer \
-  --region ap-south-1 \
+  --region us-east-1 \
   response.json && cat response.json | jq .
 ```
 
 **Common Cost Culprits:**
 
 | Cost Driver | How to Identify | Fix |
-|-------------|----------------|-----|
-| NAT Gateway data transfer | CloudWatch `BytesOutToDestination` metric | Verify VPC endpoints are active; check for pods making bulk external calls |
-| CloudWatch Logs storage | `aws logs describe-log-groups --query '*[].storedBytes'` | Set 30-day retention on all log groups |
-| Unused EBS snapshots | `aws ec2 describe-snapshots --owner-ids self` | Delete old manual snapshots |
-| Over-provisioned nodes | `kubectl top nodes` shows <30% CPU | Reduce `node_group_desired_size` to 2 and let autoscaler manage |
-
----
-
-## Issue 10: EKS Node NotReady
-
-**Symptom:** `kubectl get nodes` shows a node with `STATUS=NotReady`.
-
-**Diagnosis:**
-
-```bash
-# Describe the node for conditions
-kubectl describe node <node-name>
-# Look for: Conditions section, "Ready: False" reason
-
-# Check node events
-kubectl get events --field-selector reason=NodeNotReady
-
-# SSH into node via SSM (no bastion needed)
-aws ssm start-session \
-  --target <ec2-instance-id> \
-  --region ap-south-1
-
-# Once on node: check kubelet status
-sudo systemctl status kubelet
-sudo journalctl -u kubelet -n 50
-```
-
-**Fix A: Kubelet not running**
-
-```bash
-# On the node via SSM:
-sudo systemctl restart kubelet
-sudo systemctl enable kubelet
-```
-
-**Fix B: Node group failed to join cluster (new node)**
-
-```bash
-# Verify the node IAM role has required policies
-aws iam list-attached-role-policies \
-  --role-name ai-travel-eks-node-role \
-  --query "AttachedPolicies[].PolicyName"
-# Must include: AmazonEKSWorkerNodePolicy, AmazonEC2ContainerRegistryReadOnly,
-#               AmazonEKS_CNI_Policy
-
-# Check aws-auth ConfigMap includes the node role
-kubectl describe configmap aws-auth -n kube-system
-```
-
-**Fix C: Force node replacement**
-
-```bash
-# Cordon and drain the bad node
-kubectl cordon <node-name>
-kubectl drain <node-name> --ignore-daemonsets --delete-emptydir-data
-
-# Terminate the EC2 instance (ASG will replace it)
-aws ec2 terminate-instances --instance-ids <instance-id> --region ap-south-1
-
-# Watch for replacement
-kubectl get nodes -w
-```
+|---|---|---|
+| NAT Gateway data transfer | CloudWatch `BytesOutToDestination` | Verify all VPC endpoints active; check for pods making bulk external calls |
+| Karpenter using On-Demand instead of Spot | `kubectl get nodes -l karpenter.sh/capacity-type=on-demand` | Check Karpenter logs; Spot availability usually recovers automatically |
+| CloudWatch Logs storage | `aws logs describe-log-groups` | Set 7-day retention for dev, 30-day for prod log groups |
+| Over-provisioned RDS | Compute Optimizer recommendations | Downsize instance class after analyzing CPU metrics |
+| Unused EBS volumes | `aws ec2 describe-volumes --filters Name=status,Values=available` | Delete unattached volumes |
 
 ---
 
 ## Useful Debugging Commands Reference
 
 ```bash
-# Port-forward to service directly (bypass ingress)
-kubectl port-forward svc/user-service 8080:8000 -n ai-travel
+# Port-forward to a service directly (bypass KGateway)
+kubectl port-forward svc/user-service 8080:8000 -n prod
 # Test: curl http://localhost:8080/health
 
 # Execute shell in running pod
-kubectl exec -it <pod-name> -n ai-travel -- /bin/bash
+kubectl exec -it <pod-name> -n prod -- /bin/bash
 
-# Execute one-off command
-kubectl exec -it <pod-name> -n ai-travel -- python3 -c "import sys; print(sys.version)"
-
-# Copy file from pod
-kubectl cp ai-travel/<pod-name>:/app/logs/app.log /tmp/app.log
+# Copy a file from pod to local
+kubectl cp prod/<pod-name>:/app/logs/app.log /tmp/app.log
 
 # Check service endpoints (are pods registered?)
-kubectl get endpoints -n ai-travel
-
-# Check persistent volumes
-kubectl get pv,pvc -n ai-travel
+kubectl get endpoints -n prod
 
 # Describe a node for capacity and conditions
 kubectl describe node <node-name>
 
-# Check resource quotas and limits
-kubectl describe resourcequota -n ai-travel
-kubectl describe limitrange -n ai-travel
-
 # Watch pod restarts in real-time
-watch kubectl get pods -n ai-travel
+watch kubectl get pods -n prod
 
 # Check RBAC permissions for a service account
 kubectl auth can-i list pods \
-  --as=system:serviceaccount:ai-travel:user-service-sa \
-  -n ai-travel
+  --as=system:serviceaccount:prod:user-service-sa \
+  -n prod
 
-# Decode IRSA token (verify role binding)
-kubectl exec -it <pod-name> -n ai-travel -- \
+# Decode IRSA token to verify role binding
+kubectl exec -it <pod-name> -n prod -- \
   cat /var/run/secrets/eks.amazonaws.com/serviceaccount/token | \
   python3 -c "
 import sys, base64, json
@@ -693,6 +722,10 @@ token = sys.stdin.read().split('.')[1]
 token += '=' * (4 - len(token) % 4)
 print(json.dumps(json.loads(base64.b64decode(token).decode()), indent=2))
 "
+# Look for: "sub": "system:serviceaccount:prod:<service-sa>"
+
+# SSM Session Manager — access EKS nodes without a bastion
+aws ssm start-session --target <ec2-instance-id> --region us-east-1
 ```
 
 ---
@@ -700,10 +733,12 @@ print(json.dumps(json.loads(base64.b64decode(token).decode()), indent=2))
 ## Log Locations
 
 | Log Type | Location | How to Access |
-|----------|----------|---------------|
-| Application logs | CloudWatch: `/aws/eks/ai-travel-prod/application` | `aws logs tail /aws/eks/ai-travel-prod/application --follow` |
+|---|---|---|
+| Application logs (kubectl) | Pod stdout/stderr | `kubectl logs <pod> -n prod --tail=100 -f` |
 | EKS control plane | CloudWatch: `/aws/eks/ai-travel-prod/cluster` | AWS Console → CloudWatch → Log groups |
-| ALB access logs | S3: `ai-travel-alb-logs-{account}-ap-south-1` | `aws s3 sync s3://ai-travel-alb-logs-ACCOUNT-ap-south-1 /tmp/alb-logs` |
-| CloudTrail | S3: `ai-travel-cloudtrail-{account}-ap-south-1` | AWS Console → CloudTrail → Event history |
-| FinOps Lambda | CloudWatch: `/aws/lambda/ai-travel-finops-prod` | `aws logs tail /aws/lambda/ai-travel-finops-prod --follow` |
-| VPC Flow Logs | CloudWatch: `/aws/vpc/flowlogs/ai-travel-prod` | Useful for debugging network connectivity issues |
+| Karpenter controller | Kubernetes pod logs | `kubectl logs -n karpenter -l app.kubernetes.io/name=karpenter -f` |
+| KEDA operator | Kubernetes pod logs | `kubectl logs -n keda -l app.kubernetes.io/name=keda-operator -f` |
+| KGateway controller | Kubernetes pod logs | `kubectl logs -n kgateway-system -l app.kubernetes.io/name=kgateway -f` |
+| CloudTrail (all AWS API calls) | S3 bucket + CloudTrail console | AWS Console → CloudTrail → Event history |
+| FinOps Lambda | CloudWatch: `/aws/lambda/ai-travel-finops-prod` | `aws logs tail /aws/lambda/ai-travel-finops-prod --follow --region us-east-1` |
+| VPC Flow Logs | CloudWatch: `/aws/vpc/flowlogs/ai-travel-prod` | Useful for debugging unexpected network traffic or NAT cost spikes |

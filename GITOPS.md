@@ -1,12 +1,11 @@
-# GitOps Operations Guide
+# Plan My Journey — GitOps Operations Guide
 
 ## Overview
 
-This project uses a **GitOps** methodology: the Git repository is the single source of truth for
-the desired state of all Kubernetes resources. ArgoCD continuously reconciles the live cluster
-state against what is defined in Git.
+This project uses a **GitOps** methodology: the Git repository is the single source of truth for the desired state of all Kubernetes resources. ArgoCD continuously reconciles the live cluster state against what is defined in Git.
 
 Key principles enforced:
+
 - **No direct `kubectl apply`** for application changes — all changes flow through Git
 - **Self-healing**: ArgoCD reverts manual `kubectl` changes within 3 minutes
 - **Audit trail**: every change is a Git commit with author, timestamp, and diff
@@ -16,69 +15,69 @@ Key principles enforced:
 
 ## Repository Structure
 
+The platform uses a **multi-repository** approach, with each concern in its own repository:
+
 ```
-ai-planner-finops/
+PlanMyJourney-App/                Application source code
 │
-├── frontend/                          # React + Vite dashboard
-│   ├── src/
-│   └── Dockerfile
+├── services/
+│   ├── user-service/             FastAPI microservice
+│   ├── travel-service/           FastAPI microservice
+│   ├── ai-service/               FastAPI + Bedrock integration
+│   ├── ai-worker/                SQS consumer, KEDA-scaled
+│   └── utility-service/          FastAPI microservice (weather, hotels, maps)
+├── frontend/                     React + Vite
+└── .github/workflows/            CI workflows (build, test, scan, push to ECR)
+
+─────────────────────────────────────────────────────────────────────────
+
+PlanMyJourney-Gitops/             GitOps manifests (source of truth for cluster state)
 │
-├── services/                          # Python FastAPI microservices
+├── helm-charts/                  Helm chart definitions per service
+│   ├── frontend/
+│   │   ├── Chart.yaml
+│   │   ├── templates/
+│   │   ├── values-dev.yaml       Dev overrides (image tag updated by CI)
+│   │   └── values-prod.yaml      Prod overrides (updated for promotions)
 │   ├── user-service/
 │   ├── travel-service/
-│   ├── ai-service/                    # AWS Bedrock integration
+│   ├── ai-service/
+│   ├── ai-worker/
 │   └── utility-service/
 │
-├── infrastructure/
-│   ├── terraform/                     # Phase A — AWS infrastructure
-│   │   ├── modules/
-│   │   │   ├── networking/
-│   │   │   ├── eks/
-│   │   │   ├── rds/
-│   │   │   ├── ecr/
-│   │   │   ├── secrets/
-│   │   │   └── finops/
-│   │   ├── environments/
-│   │   │   ├── prod.tfvars
-│   │   │   └── prod-backend.hcl
-│   │   └── main.tf
-│   │
-│   ├── helm-charts/                   # Phase B — Helm chart definitions
-│   │   ├── frontend/
-│   │   │   ├── Chart.yaml
-│   │   │   ├── values.yaml            # Contains image tag (updated by CI)
-│   │   │   └── templates/
-│   │   ├── user-service/
-│   │   ├── travel-service/
-│   │   ├── ai-service/
-│   │   └── utility-service/
-│   │
-│   ├── argocd-apps/                   # Phase B — GitOps manifests
-│   │   ├── app-of-apps.yaml           # Root application (manages all others)
-│   │   ├── projects/
-│   │   │   └── ai-travel.yaml         # ArgoCD project (permissions)
-│   │   └── applications/
-│   │       ├── frontend-app.yaml
-│   │       ├── user-service-app.yaml
-│   │       ├── travel-service-app.yaml
-│   │       ├── ai-service-app.yaml
-│   │       └── utility-service-app.yaml
-│   │
-│   └── docs/                          # This documentation
-│       ├── DEPLOYMENT.md
-│       ├── ARCHITECTURE.md
-│       ├── GITOPS.md
-│       ├── FINOPS.md
-│       ├── TROUBLESHOOTING.md
-│       └── SCALING.md
+├── argocd-apps/                  ArgoCD Application manifests
+│   ├── root-app.yaml             Root app-of-apps (entry point)
+│   ├── projects/
+│   │   └── planmyjourney.yaml    ArgoCD AppProject (permission boundaries)
+│   └── applications/
+│       ├── dev/                  Per-service Applications for dev namespace
+│       └── prod/                 Per-service Applications for prod namespace
 │
-└── .github/
-    └── workflows/
-        ├── ci-frontend.yaml           # Frontend lint, test, build, push
-        ├── ci-user-service.yaml       # User service CI
-        ├── ci-travel-service.yaml
-        ├── ci-ai-service.yaml
-        └── ci-utility-service.yaml
+└── platform/                     Infrastructure platform components
+    ├── argocd/                   ArgoCD Helm values
+    ├── kgateway/                 KGateway Helm values + Gateway/HTTPRoute manifests
+    ├── karpenter/                Karpenter Helm values + NodePool + EC2NodeClass
+    ├── keda/                     KEDA Helm values + ScaledObjects + TriggerAuthentication
+    └── monitoring/               kube-prometheus-stack Helm values
+
+─────────────────────────────────────────────────────────────────────────
+
+PlanMyjourney-Terraform/          AWS infrastructure (VPC, EKS, RDS, IAM, SQS, …)
+│
+└── .github/workflows/            Terraform plan/apply workflows
+
+─────────────────────────────────────────────────────────────────────────
+
+PlanMyJourney-Workflows/          Reusable GitHub Actions workflows
+│
+└── .github/workflows/
+    ├── reusable-ci.yaml
+    ├── reusable-push-ecr.yaml
+    └── reusable-update-gitops.yaml
+
+─────────────────────────────────────────────────────────────────────────
+
+PlanMyJourney-Docs/               This documentation
 ```
 
 ---
@@ -87,28 +86,29 @@ ai-planner-finops/
 
 ### App-of-Apps Pattern
 
-A single **root Application** (`app-of-apps.yaml`) is the entry point. It points to the
-`infrastructure/argocd-apps/applications/` directory. ArgoCD reads that directory and
-creates/manages all child Applications automatically.
+A single **root Application** (`root-app.yaml`) is the entry point. It points to `argocd-apps/applications/`. ArgoCD reads that directory and creates/manages all child Applications automatically.
 
 ```
-app-of-apps (root)
-    ├── Creates: frontend-app
-    ├── Creates: user-service-app
-    ├── Creates: travel-service-app
-    ├── Creates: ai-service-app
-    └── Creates: utility-service-app
+root-app (app-of-apps, sync-wave -1)
+    ├── platform/kgateway-app      (sync-wave 0)
+    ├── platform/karpenter-app     (sync-wave 1)
+    ├── platform/keda-app          (sync-wave 1)
+    ├── platform/metrics-server    (sync-wave 1)
+    ├── platform/monitoring-app    (sync-wave 2)
+    ├── prod/frontend-app          (sync-wave 2)
+    ├── prod/user-service-app      (sync-wave 2)
+    ├── prod/travel-service-app    (sync-wave 2)
+    ├── prod/ai-service-app        (sync-wave 2)
+    ├── prod/ai-worker-app         (sync-wave 2)
+    └── prod/utility-service-app   (sync-wave 2)
 ```
 
-This means deploying a new service is as simple as adding a new `.yaml` file to
-`infrastructure/argocd-apps/applications/` and pushing to Git.
+Adding a new service is as simple as adding a new `.yaml` file to `argocd-apps/applications/prod/` and pushing to Git.
 
 ### Sync Waves
 
-Sync waves control the order of resource creation within a sync operation. Resources with a
-lower wave number are applied and must become healthy before higher wave resources are applied.
+Sync waves control the order of resource creation within a sync operation. Resources with a lower wave number are applied and must become healthy before higher wave resources are applied.
 
-Annotation syntax:
 ```yaml
 metadata:
   annotations:
@@ -120,14 +120,12 @@ metadata:
 | Mode | Behavior | When to Use |
 |------|---------|------------|
 | Auto-sync enabled | ArgoCD applies changes automatically on git push | Normal operation (all services) |
-| Auto-sync disabled | Changes require `argocd app sync <name>` command | During maintenance windows |
+| Auto-sync disabled | Changes require `argocd app sync <name>` | During maintenance windows |
 | Self-heal enabled | ArgoCD reverts manual `kubectl` changes | Always enabled in production |
 
 ### Pruning
 
-When `prune: true` is set (default for all apps), ArgoCD will **delete** Kubernetes resources
-that exist in the cluster but are no longer present in Git. This prevents resource drift and
-zombie objects accumulating in the cluster.
+When `prune: true` is set (default for all apps), ArgoCD deletes Kubernetes resources that exist in the cluster but are no longer present in Git. This prevents resource drift and zombie objects accumulating.
 
 ---
 
@@ -136,17 +134,12 @@ zombie objects accumulating in the cluster.
 ```
 Developer                 GitHub                    ArgoCD               Kubernetes
     │                        │                          │                     │
-    │──push feature branch──►│                          │                     │
-    │                        │──run CI (lint/test)──────►│                    │
-    │◄──CI passed────────────│                          │                     │
-    │──open Pull Request─────►│                          │                     │
-    │                        │──run CI (full test suite)►│                    │
-    │──merge PR to main──────►│                          │                     │
-    │                        │──CI: docker build──────────────────────────────►│
-    │                        │──CI: docker push to ECR──────────────────────────
-    │                        │──CI: update values.yaml──►│                    │
-    │                        │  (image.tag: new-sha)     │                     │
-    │                        │──CI: git commit [skip ci]─►│                   │
+    │──push to main──────────►│                          │                     │
+    │                        │──CI: lint, test, scan────►│                    │
+    │                        │──CI: docker build─────────────────────────────►│
+    │                        │──CI: push to ECR──────────────────────────────►│
+    │                        │──CI: update values-dev.yaml in Gitops repo─────►│
+    │                        │  (image.tag: <git-sha>)  │                     │
     │                        │                          │                     │
     │                        │◄─ArgoCD polls every 3min─│                     │
     │                        │                          │──detected drift──────►│
@@ -158,60 +151,80 @@ Developer                 GitHub                    ArgoCD               Kuberne
 
 ### Step-by-Step
 
-1. Developer pushes code to a feature branch (e.g., `feat/add-hotel-filter`)
-2. Pull Request is opened → GitHub Actions runs: lint, unit tests, type checks
-3. PR is reviewed and merged to `main`
-4. On merge to `main`, GitHub Actions CI pipeline runs:
-   - Builds Docker image with tag `sha-<git-short-sha>` (e.g., `sha-a1b2c3d`)
-   - Pushes image to ECR
-   - Updates `image.tag` in `infrastructure/helm-charts/<service>/values.yaml`
-   - Commits the values change with message `[skip ci] ci: update <service> image to sha-a1b2c3d`
-   - Pushes the commit back to `main`
-5. ArgoCD polls the Git repository every 3 minutes (or receives webhook notification)
-6. ArgoCD detects that `values.yaml` has changed (image tag differs from running pod)
-7. ArgoCD runs `helm upgrade` with the new values
-8. Kubernetes performs a rolling update: new pods start, old pods terminate after readiness probe passes
-9. ArgoCD confirms sync complete and marks the app as `Healthy`
+1. Developer pushes to `main` in `PlanMyJourney-App`
+2. GitHub Actions CI pipeline runs: unit tests, SAST (SonarCloud), container scan (Trivy)
+3. Docker image built with tag = full git SHA (e.g. `20cbe9b710d42565845c4673b8238a4ebc1b9a1e`)
+4. Image pushed to ECR
+5. CI commits updated `image.tag` to `PlanMyJourney-Gitops/helm-charts/<service>/values-dev.yaml`
+6. ArgoCD polls the Gitops repo every 3 minutes (or receives webhook)
+7. ArgoCD detects the diff in `values-dev.yaml` and runs `helm upgrade`
+8. Kubernetes performs a rolling update — new pods start, old pods terminate after readiness probe passes
+9. ArgoCD marks the app as `Synced + Healthy`
+
+**Prod promotion** is a separate manual step — see [DEPLOYMENT.md — Prod Promotion](DEPLOYMENT.md#prod-promotion-manual-gitops).
+
+---
+
+## KEDA ScaledObjects in GitOps
+
+KEDA ScaledObjects are managed by ArgoCD from `platform/keda/`. They define the event-driven scaling rules for the `ai-worker` and `ai-service` deployments.
+
+### ai-worker — Scale to Zero on Empty Queue
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: ai-worker-scaledobject
+  namespace: prod
+  annotations:
+    argocd.argoproj.io/sync-wave: "2"
+spec:
+  scaleTargetRef:
+    name: ai-worker
+  pollingInterval: 30
+  cooldownPeriod: 120
+  minReplicaCount: 0       # Scale to zero when no messages in queue
+  maxReplicaCount: 10
+  triggers:
+  - type: aws-sqs-queue
+    metadata:
+      queueURL: https://sqs.us-east-1.amazonaws.com/235270183260/ai-travel-prod-ai-jobs
+      queueLength: "5"     # 1 pod per 5 messages
+      awsRegion: us-east-1
+    authenticationRef:
+      name: keda-trigger-auth-aws-irsa
+```
+
+### TriggerAuthentication — IRSA (no static credentials)
+
+```yaml
+apiVersion: keda.sh/v1alpha1
+kind: TriggerAuthentication
+metadata:
+  name: keda-trigger-auth-aws-irsa
+  namespace: prod
+spec:
+  podIdentity:
+    provider: aws-eks   # Uses the keda-operator service account's IRSA role
+```
+
+The IRSA role grants `sqs:GetQueueAttributes` to the KEDA operator. No AWS access keys are stored anywhere.
 
 ---
 
 ## ArgoCD CLI Cheatsheet
 
-### Installation
-
-```bash
-# macOS
-brew install argocd
-
-# Linux
-curl -sSL -o argocd \
-  https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-chmod +x argocd && sudo mv argocd /usr/local/bin/
-
-# Windows (via scoop)
-scoop install argocd
-
-# Verify
-argocd version
-```
-
 ### Authentication
 
 ```bash
-# Login with port-forward (development)
-kubectl port-forward svc/argocd-server -n argocd 8080:443 &
-argocd login localhost:8080 \
-  --username admin \
-  --password <initial-admin-password> \
-  --insecure
-
-# Login with domain (production)
-argocd login argocd.aitravel.com \
+# Login using the public ArgoCD URL
+argocd login argocd.invest-iq.online \
   --username admin \
   --password <password>
 
 # Logout
-argocd logout argocd.aitravel.com
+argocd logout argocd.invest-iq.online
 ```
 
 ### Application Management
@@ -221,104 +234,83 @@ argocd logout argocd.aitravel.com
 argocd app list
 
 # Get detailed status of a specific app
-argocd app get frontend
+argocd app get ai-service-prod
 
-# Get detailed status with tree view
-argocd app get frontend --show-operation
-
-# Sync manually (pull latest from git and apply)
-argocd app sync frontend
+# Sync manually
+argocd app sync ai-service-prod
 
 # Sync with pruning (delete removed resources)
-argocd app sync frontend --prune
+argocd app sync ai-service-prod --prune
 
-# Sync only specific resources
-argocd app sync frontend --resource apps:Deployment:frontend
+# Force sync (re-apply everything)
+argocd app sync ai-service-prod --force
 
-# Force sync (ignore differences, re-apply everything)
-argocd app sync frontend --force
-
-# Watch sync status in real-time (blocks until sync complete)
-argocd app wait frontend --sync --health --timeout 300
+# Watch sync status in real-time
+argocd app wait ai-service-prod --sync --health --timeout 300
 
 # Diff: compare live cluster state vs git
-argocd app diff frontend
-
-# Diff: compare with specific revision
-argocd app diff frontend --revision HEAD~1
+argocd app diff ai-service-prod
 ```
 
 ### History and Rollback
 
 ```bash
 # View deployment history
-argocd app history frontend
-# ID  DATE                           REVISION
-# 1   2026-06-01 10:00:00 +0000 UTC  abc1234
-# 2   2026-06-02 11:30:00 +0000 UTC  def5678
-# 3   2026-06-03 09:00:00 +0000 UTC  ghi9012
+argocd app history ai-service-prod
 
 # Rollback to a previous revision (by ID from history)
-argocd app rollback frontend 2
+argocd app rollback ai-service-prod 2
 
-# Rollback to a specific git commit
-argocd app set frontend --revision abc1234def
-argocd app sync frontend
-
-# After rollback: re-enable auto-sync (rollback disables it)
-argocd app set frontend --sync-policy automated
+# After rollback: re-enable auto-sync
+argocd app set ai-service-prod --sync-policy automated
 ```
 
 ### Diagnostics
 
 ```bash
 # Check why an app is out of sync
-argocd app get frontend --show-operation
+argocd app get ai-service-prod --show-operation
 
 # Get the last sync operation result
-argocd app get frontend -o json | jq '.status.operationState'
+argocd app get ai-service-prod -o json | jq '.status.operationState'
 
-# List all resources managed by an app
-argocd app resources frontend
+# List resources managed by an app
+argocd app resources ai-service-prod
 
-# Get logs for a resource
-argocd app logs frontend --container frontend
-
-# Check app health status
-argocd app get frontend -o json | jq '.status.health'
-
-# List apps with issues only
-argocd app list | grep -v Synced
+# Get pod logs via ArgoCD
+argocd app logs ai-service-prod --container ai-service
 ```
 
 ---
 
 ## Adding a New Microservice
 
-Follow these steps to add a new microservice to the GitOps pipeline:
-
 ### Step 1: Create the Helm Chart
 
-```bash
-# Create chart directory
-mkdir -p infrastructure/helm-charts/new-service/templates
+In `PlanMyJourney-Gitops`:
 
-# Create Chart.yaml
-cat > infrastructure/helm-charts/new-service/Chart.yaml <<EOF
+```bash
+mkdir -p helm-charts/new-service/templates
+```
+
+Create `helm-charts/new-service/Chart.yaml`:
+
+```yaml
 apiVersion: v2
 name: new-service
 description: Description of new service
 type: application
 version: 0.1.0
 appVersion: "1.0.0"
-EOF
+```
 
-# Create values.yaml with defaults
-cat > infrastructure/helm-charts/new-service/values.yaml <<EOF
+Create `helm-charts/new-service/values-prod.yaml`:
+
+```yaml
 replicaCount: 2
 
 image:
-  repository: ACCOUNT_ID.dkr.ecr.ap-south-1.amazonaws.com/ai-travel/new-service
+  repository: <account-id>.dkr.ecr.us-east-1.amazonaws.com/planmyjourney/new-service
   tag: "latest"
   pullPolicy: IfNotPresent
 
@@ -328,11 +320,11 @@ service:
 
 resources:
   requests:
-    cpu: "100m"
-    memory: "128Mi"
+    cpu: "250m"
+    memory: "256Mi"
   limits:
-    cpu: "500m"
-    memory: "512Mi"
+    cpu: "1000m"
+    memory: "1Gi"
 
 autoscaling:
   enabled: true
@@ -340,95 +332,85 @@ autoscaling:
   maxReplicas: 5
   targetCPUUtilizationPercentage: 70
 
-ingress:
+podDisruptionBudget:
   enabled: true
-  path: /api/new/*
+  minAvailable: 1
 
 serviceAccount:
   name: new-service-sa
-  irsaRoleArn: ""   # Populated by Terraform output
-EOF
+  irsaRoleArn: ""   # Set to Terraform output after creating IRSA role
 ```
 
-### Step 2: Create Kubernetes Templates
+### Step 2: Create the ArgoCD Application Manifest
 
-```bash
-# Add standard Deployment, Service, HPA, ServiceAccount templates
-# Copy from an existing service and adjust:
-cp -r infrastructure/helm-charts/user-service/templates/ \
-      infrastructure/helm-charts/new-service/templates/
-# Edit templates to reference {{ .Values.* }} appropriately
-```
+In `argocd-apps/applications/prod/`:
 
-### Step 3: Create the ArgoCD Application Manifest
-
-```bash
-cat > infrastructure/argocd-apps/applications/new-service-app.yaml <<EOF
+```yaml
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: new-service
+  name: new-service-prod
   namespace: argocd
   annotations:
     argocd.argoproj.io/sync-wave: "2"
 spec:
-  project: ai-travel
+  project: planmyjourney
   source:
-    repoURL: https://github.com/your-org/ai-travel-planner.git
+    repoURL: https://github.com/Plan-My-Journey/PlanMyJourney-Gitops.git
     targetRevision: HEAD
-    path: infrastructure/helm-charts/new-service
+    path: helm-charts/new-service
     helm:
       valueFiles:
-        - values.yaml
+        - values-prod.yaml
   destination:
     server: https://kubernetes.default.svc
-    namespace: ai-travel
+    namespace: prod
   syncPolicy:
     automated:
       prune: true
       selfHeal: true
     syncOptions:
       - CreateNamespace=true
-EOF
+      - ServerSideApply=true
 ```
 
-### Step 4: Add IRSA Role in Terraform (if AWS access needed)
+### Step 3: Add IRSA Role in Terraform
 
 ```hcl
-# infrastructure/terraform/modules/eks/irsa.tf
+# PlanMyjourney-Terraform/modules/eks/irsa.tf
 module "new_service_irsa" {
-  source = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
-  role_name = "ai-travel-new-service"
+  source    = "terraform-aws-modules/iam/aws//modules/iam-role-for-service-accounts-eks"
+  role_name = "ai-travel-prod-new-service"
+
   oidc_providers = {
     main = {
       provider_arn               = module.eks.oidc_provider_arn
-      namespace_service_accounts = ["ai-travel:new-service-sa"]
+      namespace_service_accounts = ["prod:new-service-sa"]
     }
   }
-  # Add policy attachments as needed
+  # Attach policies as needed
 }
 ```
 
-### Step 5: Add GitHub Actions CI Workflow
+### Step 4: Add GitHub Actions CI Workflow
+
+In `PlanMyJourney-App/.github/workflows/`:
 
 ```bash
-cp .github/workflows/ci-user-service.yaml \
-   .github/workflows/ci-new-service.yaml
-# Edit: update service name, Dockerfile path, ECR repo name
+cp ci-user-service.yaml ci-new-service.yaml
+# Edit: service name, Dockerfile path, ECR repository name
 ```
 
-### Step 6: Push and Verify
+### Step 5: Push and Verify
 
 ```bash
-git add infrastructure/helm-charts/new-service/ \
-        infrastructure/argocd-apps/applications/new-service-app.yaml \
-        .github/workflows/ci-new-service.yaml
+git add helm-charts/new-service/ argocd-apps/applications/prod/new-service-prod.yaml
 git commit -m "feat: add new-service to GitOps pipeline"
 git push origin main
 
-# After push: watch ArgoCD detect and sync the new app
+# Watch ArgoCD detect and sync the new app
 argocd app list
-argocd app wait new-service --sync --health --timeout 300
+argocd app wait new-service-prod --sync --health --timeout 300
 ```
 
 ---
@@ -437,55 +419,44 @@ argocd app wait new-service --sync --health --timeout 300
 
 ### Scenario 1: Rollback via ArgoCD (Recommended)
 
-Use when: bad image was deployed and you need to quickly revert to the previous version.
-
 ```bash
 # 1. Identify the last known good revision
-argocd app history user-service
-# Note the ID of the last working deployment
+argocd app history user-service-prod
 
 # 2. Roll back
-argocd app rollback user-service <revision-id>
+argocd app rollback user-service-prod <revision-id>
 
 # 3. Monitor until healthy
-argocd app wait user-service --health --timeout 120
+argocd app wait user-service-prod --health --timeout 120
 
-# 4. Verify pods are running correctly
-kubectl get pods -n ai-travel -l app=user-service
-kubectl logs -n ai-travel -l app=user-service --tail=50
+# 4. Verify pods are running
+kubectl get pods -n prod -l app.kubernetes.io/name=user-service
+kubectl logs -n prod -l app.kubernetes.io/name=user-service --tail=50
 ```
 
-### Scenario 2: Git Revert (Infrastructure Changes)
-
-Use when: a bad Terraform change or Helm chart change was merged to main.
+### Scenario 2: Git Revert
 
 ```bash
-# 1. Identify the bad commit
-git log --oneline -10
-
-# 2. Revert the commit
+# In PlanMyJourney-Gitops:
+git log --oneline helm-charts/<service>/values-prod.yaml
 git revert <bad-commit-sha> --no-edit
-
-# 3. Push the revert
 git push origin main
 
-# 4. ArgoCD detects the revert within 3 minutes and auto-syncs
-argocd app wait user-service --sync --health --timeout 300
+# ArgoCD auto-syncs within 3 minutes
+argocd app wait user-service-prod --sync --health --timeout 300
 ```
 
 ### Scenario 3: Emergency — Disable Auto-Sync
 
-Use when: you need to stop ArgoCD from applying changes while you debug.
-
 ```bash
-# Disable auto-sync for ALL apps (emergency)
-for app in frontend user-service travel-service ai-service utility-service; do
-  argocd app set $app --sync-policy none
+# Disable auto-sync to stop ArgoCD from applying changes while you debug
+for app in frontend user-service travel-service ai-service ai-worker utility-service; do
+  argocd app set ${app}-prod --sync-policy none
 done
 
-# Re-enable after fix
-for app in frontend user-service travel-service ai-service utility-service; do
-  argocd app set $app --sync-policy automated
+# Re-enable after the fix
+for app in frontend user-service travel-service ai-service ai-worker utility-service; do
+  argocd app set ${app}-prod --sync-policy automated
 done
 ```
 
@@ -493,72 +464,48 @@ done
 
 ## Troubleshooting Sync Issues
 
-### Issue: App is OutOfSync but changes look correct
+### App is OutOfSync but changes look correct
 
 ```bash
 # Check what ArgoCD thinks is different
-argocd app diff user-service
+argocd app diff user-service-prod
 
 # Force a hard refresh (clears ArgoCD's cached state)
-argocd app get user-service --hard-refresh
+argocd app get user-service-prod --hard-refresh
 
-# If using Helm: check if Helm release has manual changes
-helm history user-service -n ai-travel
+# If using ServerSideApply: check for field manager conflicts
+kubectl get deployment user-service -n prod -o yaml | grep managedFields
 ```
 
-### Issue: Helm Rendering Error
+### Helm Rendering Error
 
 ```bash
 # Test Helm rendering locally before pushing
-helm template user-service infrastructure/helm-charts/user-service/ \
-  --values infrastructure/helm-charts/user-service/values.yaml
+helm template user-service helm-charts/user-service/ \
+  --values helm-charts/user-service/values-prod.yaml
 
 # Common cause: missing required values, template syntax errors
-# Fix the template and push to git
 ```
 
-### Issue: "Resource already exists" Error
-
-This happens when a Kubernetes resource was created manually (not via Helm) and ArgoCD tries to adopt it.
+### "Resource already exists" Error
 
 ```bash
-# Option A: Add the resource to Helm and annotate it
-kubectl annotate <resource-type> <name> -n ai-travel \
+# Annotate and label the orphan resource so Helm/ArgoCD can adopt it
+kubectl annotate deployment user-service -n prod \
   meta.helm.sh/release-name=user-service \
-  meta.helm.sh/release-namespace=ai-travel
-kubectl label <resource-type> <name> -n ai-travel \
+  meta.helm.sh/release-namespace=prod
+kubectl label deployment user-service -n prod \
   app.kubernetes.io/managed-by=Helm
 
-# Option B: Delete the orphan resource and let ArgoCD recreate it
-kubectl delete <resource-type> <name> -n ai-travel
-argocd app sync user-service
+argocd app sync user-service-prod
 ```
 
-### Issue: ArgoCD RBAC Permission Error
+### ArgoCD RBAC Permission Error
 
 ```bash
-# Check ArgoCD logs for RBAC error details
+# Check ArgoCD controller logs
 kubectl logs -n argocd -l app.kubernetes.io/name=argocd-application-controller --tail=50
 
-# Check the ArgoCD project permissions
-kubectl get appproject ai-travel -n argocd -o yaml
-
-# Add missing namespace/resource permissions to the project
-kubectl edit appproject ai-travel -n argocd
-```
-
-### Issue: Image Pull Fails in ArgoCD Sync
-
-```bash
-# Verify the ECR image exists
-aws ecr describe-images \
-  --repository-name ai-travel/user-service \
-  --image-ids imageTag=sha-abc1234 \
-  --region ap-south-1
-
-# Check IRSA for image pull (pods use IRSA to pull from ECR)
-kubectl describe pod <pod-name> -n ai-travel | grep -A 10 "Events:"
-
-# Refresh ECR auth token (if using static imagePullSecrets)
-# (IRSA-based pull does not require this — token auto-refreshes)
+# Check the AppProject permissions
+kubectl get appproject planmyjourney -n argocd -o yaml
 ```

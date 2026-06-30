@@ -23,6 +23,7 @@ A production-grade, cloud-native travel planning platform built on AWS. Plan My 
 - [Local Development](#local-development)
 - [Deployment](#deployment)
 - [Scaling](#scaling)
+- [Disaster Recovery](#disaster-recovery)
 - [Cost Management (FinOps)](#cost-management-finops)
 - [Detailed Documentation](#detailed-documentation)
 
@@ -184,7 +185,8 @@ The project is split across five GitHub repositories under the [`Plan-My-Journey
 | Terraform | Infrastructure as code |
 | Helm | Kubernetes package manager |
 | ArgoCD | GitOps continuous delivery |
-| Cluster Autoscaler | Node-level autoscaling |
+| Karpenter | Just-in-time node provisioning with spot/on-demand mix |
+| KEDA | Event-driven pod autoscaling based on SQS queue depth |
 | Prometheus + Grafana | In-cluster metrics and dashboards |
 | GitHub Actions | CI/CD automation |
 
@@ -834,21 +836,39 @@ git push origin main
 
 ## Scaling
 
-### Horizontal Pod Autoscaling (HPA)
+The platform uses three complementary layers of autoscaling to handle variable traffic efficiently.
+
+### KEDA — Event-Driven Pod Autoscaling
+
+[KEDA (Kubernetes Event Driven Autoscaler)](https://keda.sh) drives pod scaling for event-driven workloads based on external queue depth rather than CPU alone.
+
+| Workload | Trigger | Min Pods | Max Pods | Scale-to-Zero |
+|---|---|---|---|---|
+| `ai-worker` | SQS queue depth (1 pod per 5 messages) | 0 | 10 | Yes — scales to zero when queue is empty |
+| `ai-service` | SQS queue depth + HTTP request rate | 2 | 10 | No — always on |
+
+KEDA uses `TriggerAuthentication` backed by IRSA to access SQS queue metrics without static credentials.
+
+### HPA — CPU-Based Pod Autoscaling
+
+Standard Kubernetes HPA handles CPU-driven scaling for stateless services:
 
 | Service | Min Replicas | Max Replicas | CPU Target | Memory Target |
 |---|---|---|---|---|
-| frontend | 2 | 10 | 60% | 70% |
-| ai-service | 2 | 5 | 70% | — |
-| travel-service | 2 | 2 | — | — |
-| user-service | 2 | 2 | — | — |
-| utility-service | 2 | 2 | — | — |
+| `frontend` | 2 | 10 | 60% | 70% |
+| `travel-service` | 2 | 5 | 70% | — |
+| `user-service` | 2 | 5 | 70% | — |
+| `utility-service` | 2 | 5 | 70% | — |
 
-### Node Autoscaling (Cluster Autoscaler)
+### Karpenter — Node Autoscaling
 
-- Scales the EKS managed node group from 2 to 6 nodes based on pod scheduling pressure
-- Scales down when node utilisation drops below 50% for 10+ minutes
-- Each node is a t3.medium (2 vCPU, 4 GB RAM)
+[Karpenter](https://karpenter.sh) provisions and deprovisions EKS nodes just-in-time, faster and more cost-efficiently than the traditional Cluster Autoscaler.
+
+- **NodePool** defines instance families (t3, t3a, m5), architecture (amd64), and capacity types (Spot + On-Demand mix)
+- **EC2NodeClass** defines the AMI family, subnet selectors, and security group selectors
+- **Consolidation policy** (`WhenUnderutilized`) automatically bin-packs and removes underutilised nodes after 30 seconds
+- Nodes are provisioned in under 60 seconds (vs 3–5 minutes with Cluster Autoscaler)
+- Spot instances are preferred, with automatic fallback to On-Demand for critical workloads
 
 ### Database Scaling
 
@@ -856,6 +876,66 @@ git push origin main
 - RDS instance class upgrade requires a maintenance window
 
 See [SCALING.md](./SCALING.md) for detailed guidance.
+
+---
+
+## Disaster Recovery
+
+The platform is designed for high availability and rapid recovery from infrastructure failures.
+
+### Recovery Objectives
+
+| Metric | Target | Mechanism |
+|---|---|---|
+| RTO (Recovery Time Objective) | < 15 minutes | RDS Multi-AZ automatic failover; EKS self-healing pods |
+| RPO (Recovery Point Objective) | < 1 minute | RDS Multi-AZ synchronous replication; no data loss on failover |
+
+### RDS High Availability (Multi-AZ)
+
+- **Multi-AZ enabled** — RDS maintains a synchronous standby replica in a second Availability Zone (`us-east-1b`)
+- Automatic failover triggers within 60–120 seconds on primary failure with no manual intervention required
+- All writes are synchronously committed to both the primary and standby before acknowledging success
+- `deletion_protection = true` prevents accidental database deletion
+- `skip_final_snapshot = false` — a final snapshot is taken before any planned deletion
+
+### Automated Backups
+
+| Backup Type | Retention | Scope |
+|---|---|---|
+| RDS automated daily snapshots | 30 days | Full database (user_db + travel_db) |
+| RDS Multi-AZ standby | Continuous (synchronous) | Live replication — no RPO gap |
+| Terraform state | Indefinite (S3 versioning) | Full infrastructure definition recovery |
+
+### Cross-AZ Resilience
+
+- EKS nodes are distributed across `us-east-1a` and `us-east-1b`
+- **Pod Disruption Budgets** ensure at least one pod per service remains available during node failures or voluntary disruptions (Karpenter consolidation, rolling updates)
+- NAT Gateways are deployed per-AZ to prevent cross-AZ single points of failure
+- RDS database subnets span both AZs
+
+### Infrastructure Recovery
+
+In the event of a full environment loss, the platform can be rebuilt from code:
+
+```bash
+# 1. Restore infrastructure from Terraform state (S3 versioned bucket)
+terraform init && terraform apply -var-file="environments/prod.tfvars"
+
+# 2. Bootstrap ArgoCD — automatically re-deploys all services via GitOps
+kubectl apply -f argocd-apps/app-of-apps.yaml
+
+# 3. Restore database from latest RDS snapshot
+aws rds restore-db-instance-from-db-snapshot \
+  --db-instance-identifier ai-travel-prod-restored \
+  --db-snapshot-identifier <snapshot-id> \
+  --region us-east-1
+```
+
+### Backup Verification
+
+Database restore drills are conducted quarterly to validate that backups are restorable and that the restored database passes application-level health checks.
+
+See [ARCHITECTURE.md](./ARCHITECTURE.md) for the full DR architecture.
 
 ---
 

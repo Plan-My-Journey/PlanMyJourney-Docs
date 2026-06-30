@@ -1,456 +1,423 @@
-# AI-Travel-Planner: Deployment Guide
+# Plan My Journey — Deployment Guide
 
-## Overview
+This guide covers the end-to-end process for provisioning infrastructure, deploying the platform to Kubernetes, and promoting releases between environments. All deployments follow a GitOps model — no `kubectl apply` is run from a developer's laptop in normal operation.
 
-This guide covers the complete end-to-end deployment of the AI-Travel-Planner platform to AWS. Deployment
-is split into two distinct phases:
+---
 
-- **Phase A – Infrastructure**: Terraform provisions the foundational AWS resources (VPC, EKS, RDS,
-  ECR, Secrets Manager, FinOps Lambda, etc.). This phase runs once and is idempotent.
-- **Phase B – Applications**: Kubernetes workloads are deployed via ArgoCD using a GitOps app-of-apps
-  pattern. Image builds are automated through GitHub Actions CI/CD pipelines.
+## Table of Contents
 
-Total estimated first-time deployment time: **40–60 minutes** (infrastructure ~25–35 min, apps ~10–15 min).
+- [Prerequisites](#prerequisites)
+- [Repository Structure](#repository-structure)
+- [First-Time Bootstrap](#first-time-bootstrap)
+  - [1. Terraform — Infrastructure Provisioning](#1-terraform--infrastructure-provisioning)
+  - [2. ArgoCD Bootstrap](#2-argocd-bootstrap)
+  - [3. Karpenter Bootstrap](#3-karpenter-bootstrap)
+  - [4. KEDA Bootstrap](#4-keda-bootstrap)
+  - [5. KGateway Bootstrap](#5-kgateway-bootstrap)
+  - [6. Secrets Setup](#6-secrets-setup)
+  - [7. Platform Validation](#7-platform-validation)
+- [Standard Release Process](#standard-release-process)
+  - [Dev Deployment (Automatic)](#dev-deployment-automatic)
+  - [Prod Promotion (Manual GitOps)](#prod-promotion-manual-gitops)
+- [Environment Configuration](#environment-configuration)
+- [Rollback Procedure](#rollback-procedure)
+- [Disaster Recovery Deployment](#disaster-recovery-deployment)
 
 ---
 
 ## Prerequisites
 
-Ensure all tools are installed and authenticated **before** starting.
+| Tool | Install method | Notes |
+|---|---|---|
+| AWS CLI | Official installer | Configure with SSO or IAM user |
+| Terraform | `tfenv` recommended | Manages multiple Terraform versions |
+| kubectl | `asdf` or OS package manager | Matches cluster minor version |
+| Helm | Official installer | Used for bootstrap installs only |
+| ArgoCD CLI | `argocd` binary | Optional — UI available at `https://argocd.invest-iq.online` |
+| GitHub CLI | `gh` | Required for triggering manual workflows |
 
-| Tool | Version | Installation Link | Purpose |
-|------|---------|-------------------|---------|
-| AWS CLI | v2.x | https://docs.aws.amazon.com/cli/latest/userguide/install-cliv2.html | Authenticates with AWS; ECR login |
-| Terraform | >= 1.7 | https://developer.hashicorp.com/terraform/install | Provisions all AWS infrastructure |
-| kubectl | >= 1.29 | https://kubernetes.io/docs/tasks/tools/ | Manages Kubernetes resources |
-| Helm | >= 3.14 | https://helm.sh/docs/intro/install/ | Packages and installs Kubernetes apps |
-| ArgoCD CLI | >= 2.9 | https://argo-cd.readthedocs.io/en/stable/cli_installation/ | Manages GitOps sync and rollbacks |
-| Docker | >= 24.x | https://docs.docker.com/engine/install/ | Builds and pushes container images |
-| jq | any | https://jqlang.github.io/jq/download/ | Parses JSON in shell scripts |
-| yq | >= 4.x | https://github.com/mikefarah/yq | Parses/edits YAML in shell scripts |
-| PowerShell | >= 7.x | https://aka.ms/powershell | Required for `.ps1` build scripts (Windows) |
-
-### Verify All Tools
-
-```bash
-aws --version           # aws-cli/2.x.x
-terraform version       # Terraform v1.7.x
-kubectl version --client # v1.29.x
-helm version            # v3.14.x
-argocd version          # argocd: v2.9.x
-docker --version        # Docker version 24.x.x
-jq --version            # jq-1.x
-yq --version            # yq version v4.x.x
-```
+AWS credentials for humans: use IAM Identity Center (SSO) or an IAM user with sufficient permissions for Terraform. The CI/CD pipelines use GitHub OIDC — no static credentials are stored anywhere.
 
 ---
 
-## Phase A: Infrastructure Deployment
+## Repository Structure
 
-### 1. AWS Account Setup
+The platform is split across four repositories:
 
-#### Configure AWS CLI Profile
-
-```bash
-aws configure --profile ai-travel-prod
-# AWS Access Key ID: <your-access-key>
-# AWS Secret Access Key: <your-secret-key>
-# Default region name: ap-south-1
-# Default output format: json
-
-# Verify authentication
-aws sts get-caller-identity --profile ai-travel-prod
+```
+PlanMyJourney-App/        Application source code (services, Dockerfiles)
+PlanMyJourney-Gitops/     Helm charts + ArgoCD Application manifests + values-*.yaml
+PlanMyJourney-Workflows/  Reusable GitHub Actions workflows shared across repos
+PlanMyjourney-Terraform/  AWS infrastructure (VPC, EKS, RDS, IAM, SQS, …)
+PlanMyJourney-Docs/       This documentation
 ```
 
-#### Required IAM Permissions
-
-The deploying IAM user/role must have broad permissions. The minimum required managed policies are:
-
-| Policy | Reason |
-|--------|--------|
-| `AdministratorAccess` | Recommended for initial setup |
-| OR custom policy covering: | |
-| `AmazonEKSFullAccess` | EKS cluster creation |
-| `AmazonEC2FullAccess` | VPC, subnets, security groups, NAT |
-| `AmazonRDSFullAccess` | RDS instance and parameter groups |
-| `AmazonS3FullAccess` | Terraform state bucket, ALB logs |
-| `AWSLambda_FullAccess` | FinOps Lambda function |
-| `AmazonDynamoDBFullAccess` | Terraform state lock table |
-| `SecretsManagerReadWrite` | Application secrets |
-| `AmazonBedrockFullAccess` | Bedrock model access |
-| `IAMFullAccess` | IRSA roles for pods |
-
-#### Enable Required AWS Services
-
-Some services must be explicitly enabled before Terraform can use them:
-
-```bash
-# Enable Cost Explorer (first-time: can take up to 24h to activate)
-aws ce update-cost-allocation-tags-status \
-  --cost-allocation-tags-status TagKey=Project,Status=Active
-
-# Verify Bedrock is available in ap-south-1
-aws bedrock list-foundation-models \
-  --region ap-south-1 \
-  --query "modelSummaries[?modelId=='amazon.nova-pro-v1:0']"
-```
+The Terraform and GitOps repositories are intentionally separate so that infrastructure changes and application changes have independent approval and audit trails.
 
 ---
 
-### 2. Enable Amazon Bedrock Model Access
+## First-Time Bootstrap
 
-The AI service (`ai-service`) uses `amazon.nova-pro-v1:0` via the Bedrock Converse API. Model access
-must be **manually requested** before Terraform deploys the IRSA permissions.
+### 1. Terraform — Infrastructure Provisioning
 
-**Steps:**
-
-1. Open the [AWS Console](https://console.aws.amazon.com) in region **ap-south-1** (Mumbai)
-2. Navigate to **Amazon Bedrock** → **Model access** (left sidebar)
-3. Click **Manage model access**
-4. Find **Amazon Nova Pro** (`amazon.nova-pro-v1:0`) and check the box
-5. Click **Request model access** → **Submit**
-6. Wait for status to change from `Available to request` → **`Access granted`** (usually instant for Nova Pro)
-
-> **Important:** Without this step, the `ai-service` pod will start successfully but return fallback
-> responses. Check the pod logs for `AccessDeniedException` errors from Bedrock.
-
----
-
-### 3. Bootstrap Terraform State Backend
-
-The state backend (S3 + DynamoDB) must exist before running `terraform init`. A dedicated bootstrap
-script handles this:
+Clone `PlanMyjourney-Terraform` and initialise:
 
 ```bash
-cd infrastructure/terraform
-make bootstrap
+git clone https://github.com/Plan-My-Journey/PlanMyjourney-Terraform.git
+cd PlanMyjourney-Terraform
+
+terraform init    # downloads providers, connects to S3 state backend
+terraform plan    # review all changes
+terraform apply   # takes ~15 minutes on first run
 ```
 
-**What `make bootstrap` creates:**
+Resources created by Terraform:
 
-| Resource | Name | Purpose |
-|----------|------|---------|
-| S3 Bucket | `ai-travel-terraform-state-{account_id}` | Stores `.tfstate` files with versioning + encryption |
-| DynamoDB Table | `ai-travel-terraform-locks` | Prevents concurrent `terraform apply` runs (state locking) |
-| S3 Bucket Policy | (attached to above) | Enforces HTTPS-only access |
-| KMS Key | (CMK) | Encrypts all state files at rest |
+| Resource | Notes |
+|---|---|
+| VPC | 10.0.0.0/16, us-east-1, public + private + database subnets, 2 NAT GWs, VPC endpoints |
+| EKS cluster | `ai-travel-prod`, private worker nodes, OIDC provider |
+| Managed node group | Baseline nodes, gp3 EBS, KMS encrypted |
+| Karpenter node IAM role | `ai-travel-prod-karpenter-node` — referenced by EC2NodeClass |
+| KEDA IRSA role | `ai-travel-prod-keda-operator` — allows `sqs:GetQueueAttributes` |
+| RDS PostgreSQL Multi-AZ | Private subnets, KMS CMK, 30-day backups, deletion protection ON |
+| SQS queue | `ai-travel-prod-ai-jobs` with dead letter queue |
+| DynamoDB | `ai-travel-prod-ai-jobs` (async job tracking) |
+| Secrets Manager | One secret per service — database URL, API keys |
+| Cognito user pool | Hosted UI, RS256 JWT |
+| S3 | Terraform state bucket (versioned, KMS) |
+| CloudTrail | Full audit logging |
 
-If you need to run this manually:
+Update kubeconfig after the cluster is created:
 
 ```bash
-# Bootstrap is idempotent — safe to run multiple times
-cd infrastructure/terraform
-bash scripts/bootstrap-state.sh
-
-# Verify S3 bucket was created
-aws s3 ls | grep ai-travel-terraform-state
+aws eks update-kubeconfig --region us-east-1 --name ai-travel-prod
+kubectl get nodes   # verify nodes appear
 ```
 
----
+### 2. ArgoCD Bootstrap
 
-### 4. Deploy Infrastructure with Terraform
-
-```bash
-cd infrastructure/terraform
-
-# Initialize: downloads providers, configures backend
-make init
-# OR: terraform init -backend-config="environments/prod-backend.hcl"
-
-# Plan: preview all resources to be created (no changes made)
-make plan
-# OR: terraform plan -var-file="environments/prod.tfvars" -out=tfplan
-
-# !!! REVIEW THE PLAN OUTPUT CAREFULLY !!!
-# Look for: resource counts, any unexpected destroys (~)
-# Expected: ~120 resources to add, 0 to change, 0 to destroy
-
-# Apply: create all resources (~25–35 minutes)
-make apply
-# OR: terraform apply tfplan
-```
-
-**Resources created during `make apply`:**
-
-| Category | Resources |
-|----------|-----------|
-| Networking | VPC, 6 subnets (2 public, 2 private, 2 DB), IGW, 2 NAT GWs, route tables, NACLs |
-| EKS | Cluster (v1.29), managed node group (t3.medium × 2), OIDC provider |
-| Add-ons | AWS VPC CNI, CoreDNS, kube-proxy, EBS CSI driver |
-| RDS | PostgreSQL 15.4 Multi-AZ instance (db.t3.micro), subnet group, parameter group |
-| ECR | 5 repositories: frontend, user-service, travel-service, ai-service, utility-service |
-| IAM | 8 IRSA roles (per-service + cluster autoscaler + ALB controller + FinOps) |
-| Secrets | 6 secrets in Secrets Manager (GitHub token, DB credentials, API keys) |
-| FinOps | Lambda function, EventBridge rules, SNS topic, DynamoDB table |
-| Observability | CloudWatch log groups, metric alarms, dashboard |
-| VPC Endpoints | S3 (gateway), DynamoDB (gateway), ECR API, ECR DKR, Secrets Manager, SSM, Bedrock |
-
----
-
-### 5. Collect Terraform Outputs
-
-After `make apply` completes, capture output values needed for Phase B:
+ArgoCD is the only component installed via `helm install` directly — everything else is managed by ArgoCD afterwards.
 
 ```bash
-cd infrastructure/terraform
-terraform output
-
-# Save to a file for reference
-terraform output -json > /tmp/tf-outputs.json
-
-# Key values to note:
-terraform output cluster_name          # ai-travel-prod
-terraform output cluster_endpoint      # https://XXXX.gr7.ap-south-1.eks.amazonaws.com
-terraform output rds_endpoint          # ai-travel-prod.XXXX.ap-south-1.rds.amazonaws.com:5432
-terraform output ecr_repository_urls   # map of service → ECR URL
-terraform output alb_dns_name          # ai-travel-XXXX.ap-south-1.elb.amazonaws.com
-terraform output finops_lambda_arn     # arn:aws:lambda:ap-south-1:XXXX:function:...
-terraform output vpc_id                # vpc-XXXXXXXXXX
-```
-
----
-
-### 6. Populate Secrets in AWS Secrets Manager
-
-Several secrets must be populated manually after infrastructure creation. Terraform creates the
-secret shells; this step fills in the actual values.
-
-```bash
-# GitHub Personal Access Token (for ArgoCD to pull from private repos)
-aws secretsmanager put-secret-value \
-  --secret-id "ai-travel/github-token" \
-  --secret-string '{"token": "ghp_XXXXXXXXXXXX"}' \
-  --region ap-south-1
-
-# Third-party API keys for utility-service (OpenWeather, Amadeus, etc.)
-aws secretsmanager put-secret-value \
-  --secret-id "ai-travel/utility-api-keys" \
-  --secret-string '{
-    "OPENWEATHER_API_KEY": "your-openweather-key",
-    "AMADEUS_CLIENT_ID": "your-amadeus-client-id",
-    "AMADEUS_CLIENT_SECRET": "your-amadeus-client-secret",
-    "CURRENCY_API_KEY": "your-currency-api-key"
-  }' \
-  --region ap-south-1
-
-# FinOps email configuration (for cost alert emails)
-aws secretsmanager put-secret-value \
-  --secret-id "ai-travel/finops-config" \
-  --secret-string '{
-    "NOTIFICATION_EMAIL": "devops@yourcompany.com",
-    "COST_ALERT_THRESHOLD": "500"
-  }' \
-  --region ap-south-1
-
-# Verify secrets are populated
-aws secretsmanager list-secrets \
-  --region ap-south-1 \
-  --query "SecretList[?starts_with(Name, 'ai-travel')].{Name: Name, LastChanged: LastChangedDate}"
-```
-
-> **Note:** The `DATABASE_URL` secret is auto-populated by Terraform using the RDS endpoint and
-> credentials generated during `make apply`. You do not need to set this manually.
-
-> **Bedrock:** No API key is required. The `ai-service` uses IRSA to authenticate with Bedrock
-> via the pod's service account token. The GROQ dependency has been removed.
-
----
-
-## Phase B: Application Deployment
-
-### 1. Configure kubectl for EKS
-
-```bash
-# Update local kubeconfig (replaces or merges with ~/.kube/config)
-aws eks update-kubeconfig \
-  --name ai-travel-prod \
-  --region ap-south-1 \
-  --profile ai-travel-prod
-
-# Verify cluster access
-kubectl get nodes
-# Expected output (after ~2 min):
-# NAME                                       STATUS   ROLES    AGE   VERSION
-# ip-10-0-10-xx.ap-south-1.compute.internal  Ready    <none>   2m    v1.29.x
-
-# Check all system pods are running
-kubectl get pods -n kube-system
-```
-
----
-
-### 2. Install ArgoCD
-
-```bash
-# Create namespace
 kubectl create namespace argocd
 
-# Install ArgoCD (stable release)
-kubectl apply -n argocd \
-  -f https://raw.githubusercontent.com/argoproj/argo-cd/stable/manifests/install.yaml
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo update
 
-# Wait for all ArgoCD components to become ready
-kubectl wait --for=condition=available deployment/argocd-server \
-  -n argocd --timeout=300s
+helm install argocd argo/argo-cd \
+  --namespace argocd \
+  --values PlanMyJourney-Gitops/platform/argocd/values.yaml
 
-kubectl wait --for=condition=available deployment/argocd-application-controller \
-  -n argocd --timeout=300s
+# Wait for ArgoCD to become ready
+kubectl rollout status deployment/argocd-server -n argocd --timeout=300s
 
-# Retrieve the initial admin password
+# Apply the root Application (app-of-apps)
+kubectl apply -f PlanMyJourney-Gitops/argocd-apps/root-app.yaml
+```
+
+ArgoCD then takes over and syncs all infrastructure and application components from the `PlanMyJourney-Gitops` repository.
+
+Access the ArgoCD UI: `https://argocd.invest-iq.online`
+
+Retrieve the initial admin password:
+
+```bash
 kubectl -n argocd get secret argocd-initial-admin-secret \
-  -o jsonpath="{.data.password}" | base64 -d ; echo
-
-# Access ArgoCD UI via port-forward (temporary)
-kubectl port-forward svc/argocd-server -n argocd 8080:443
-# Open: https://localhost:8080  (user: admin, password: <from above>)
+  -o jsonpath="{.data.password}" | base64 --decode
 ```
 
-> **Production setup:** Expose ArgoCD via the ALB ingress (see `infrastructure/argocd-apps/argocd-ingress.yaml`)
-> so it is accessible via `https://argocd.aitravel.com` without port-forwarding.
+### 3. Karpenter Bootstrap
 
----
+Karpenter requires two prerequisites before ArgoCD can install it:
 
-### 3. Bootstrap App-of-Apps
+1. The Karpenter CRDs (`NodePool`, `EC2NodeClass`) must be registered.
+2. The Karpenter controller must have an IRSA role.
+
+Both are managed by Terraform. After `terraform apply` completes:
 
 ```bash
-# Create the ArgoCD project (defines permissions and allowed repos)
-kubectl apply -f infrastructure/argocd-apps/projects/ai-travel.yaml
+# Verify the Karpenter node IAM role exists
+aws iam get-role --role-name ai-travel-prod-karpenter-node
 
-# Apply the root app-of-apps (this single manifest deploys ALL services)
-kubectl apply -f infrastructure/argocd-apps/app-of-apps.yaml
-
-# Watch ArgoCD sync all child applications (~5–8 minutes)
-kubectl get applications -n argocd -w
-# Expected: All apps reach Status=Synced Health=Healthy
-
-# OR use ArgoCD CLI
-argocd login localhost:8080 --username admin --password <password> --insecure
-argocd app list
+# Verify the EC2NodeClass subnet/SG discovery tags are in place
+aws ec2 describe-subnets \
+  --filters "Name=tag:karpenter.sh/discovery,Values=ai-travel-prod" \
+  --query 'Subnets[].SubnetId'
 ```
 
----
+ArgoCD (after the root app is applied) installs Karpenter via the Helm chart in `PlanMyJourney-Gitops/platform/karpenter/`. The NodePool and EC2NodeClass manifests are applied in the same sync wave.
 
-### 4. Build and Push Docker Images
+Verify Karpenter is running and ready to provision nodes:
 
 ```bash
-# Get AWS account ID
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-REGION="ap-south-1"
-ECR_REGISTRY="${ACCOUNT_ID}.dkr.ecr.${REGION}.amazonaws.com"
-
-# Authenticate Docker with ECR
-aws ecr get-login-password --region ${REGION} | \
-  docker login --username AWS --password-stdin ${ECR_REGISTRY}
-
-# Build and push all services (Windows PowerShell)
-./scripts/build-and-push-ecr.ps1 -Region ${REGION} -AccountId ${ACCOUNT_ID}
-
-# OR build individual services manually:
-# Frontend
-docker build -t ${ECR_REGISTRY}/ai-travel/frontend:latest \
-  -f frontend/Dockerfile frontend/
-docker push ${ECR_REGISTRY}/ai-travel/frontend:latest
-
-# User Service
-docker build -t ${ECR_REGISTRY}/ai-travel/user-service:latest \
-  -f services/user-service/Dockerfile services/user-service/
-docker push ${ECR_REGISTRY}/ai-travel/user-service:latest
-
-# AI Service
-docker build -t ${ECR_REGISTRY}/ai-travel/ai-service:latest \
-  -f services/ai-service/Dockerfile services/ai-service/
-docker push ${ECR_REGISTRY}/ai-travel/ai-service:latest
+kubectl get pods -n karpenter
+kubectl get nodepools
+kubectl get ec2nodeclasses
 ```
 
----
+### 4. KEDA Bootstrap
 
-### 5. Verify Deployment
+KEDA is installed via ArgoCD from `PlanMyJourney-Gitops/platform/keda/`. No manual steps are required after the root app is applied.
+
+Verify KEDA is operational:
 
 ```bash
-# Check all applications synced in ArgoCD
-argocd app list
-# All apps should show: STATUS=Synced  HEALTH=Healthy
-
-# Check all pods are running in the ai-travel namespace
-kubectl get pods -n ai-travel
-# Expected: frontend, user-service, travel-service, ai-service, utility-service all Running
-
-# Check ingress was created and has an ADDRESS
-kubectl get ingress -n ai-travel
-# NAME       CLASS    HOSTS                ADDRESS                          PORTS
-# frontend   nginx    aitravel.com         ai-travel-XXXX.elb.amazonaws.com 80,443
-
-# Smoke test: health check each service
-curl https://api.aitravel.com/health          # should return 200
-curl https://api.aitravel.com/users/health    # 200
-curl https://api.aitravel.com/travel/health   # 200
-curl https://api.aitravel.com/ai/health       # 200
-curl https://api.aitravel.com/utility/health  # 200
+kubectl get pods -n keda
+kubectl get scaledobjects -n prod
+kubectl get triggerauthentications -n prod
 ```
 
----
-
-### 6. DNS Configuration
+Verify KEDA can read the SQS queue:
 
 ```bash
-# Get ALB DNS name from Terraform output or kubectl
-ALB_DNS=$(kubectl get ingress frontend -n ai-travel \
-  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
-echo $ALB_DNS  # ai-travel-XXXX.ap-south-1.elb.amazonaws.com
-
-# Option A: Route53 (recommended)
-# Create CNAME or ALIAS record in your hosted zone:
-#   aitravel.com     → ALIAS → ${ALB_DNS}
-#   www.aitravel.com → CNAME → ${ALB_DNS}
-
-# Option B: External DNS (automated, if installed)
-# Add annotation to ingress:
-#   external-dns.alpha.kubernetes.io/hostname: aitravel.com
-
-# Verify DNS propagation
-dig aitravel.com         # should resolve to ALB IP
-curl -I https://aitravel.com   # should return HTTP 200
+kubectl describe scaledobject ai-worker-scaledobject -n prod
+# Look for "Successfully set metric source" in Events
 ```
 
----
+### 5. KGateway Bootstrap
 
-## Post-Deployment Checklist
+KGateway (Envoy-based Kubernetes Gateway API implementation) is managed by ArgoCD. After the root app is applied, ArgoCD installs KGateway and applies all `Gateway` and `HTTPRoute` resources.
 
-- [ ] `kubectl get nodes` shows all nodes `Ready`
-- [ ] `kubectl get pods -n ai-travel` shows all pods `Running` (no restarts)
-- [ ] `argocd app list` shows all apps `Synced` and `Healthy`
-- [ ] Health endpoint returns 200 for all 5 services
-- [ ] ArgoCD UI accessible (https://argocd.aitravel.com or via port-forward)
-- [ ] Bedrock model access enabled (`amazon.nova-pro-v1:0` in ap-south-1)
-- [ ] DNS resolves to ALB correctly
-- [ ] HTTPS certificate is valid (check via browser or `curl -I`)
-- [ ] All secrets populated in Secrets Manager (verify via AWS Console)
-- [ ] FinOps Lambda executes without error (check CloudWatch Logs)
-- [ ] CloudWatch alarms are in `OK` state (no immediate alerts)
-- [ ] RDS accessible from within EKS pods (test with `kubectl exec`)
-- [ ] ECR image scan shows no critical vulnerabilities
-- [ ] GitHub Actions CI pipeline passes on a test commit
-
----
-
-## Teardown (Destroy All Resources)
-
-> **Warning:** This permanently destroys all data including RDS databases. Take manual snapshots first.
+Verify the Gateway is programmed and the NLB is provisioned:
 
 ```bash
-# Step 1: Delete all Kubernetes resources (ArgoCD cascade delete)
-argocd app delete app-of-apps --cascade
+kubectl get gateway -n kgateway-system
+# STATUS should show: Programmed=True
 
-# Step 2: Wait for namespace cleanup
-kubectl wait --for=delete namespace/ai-travel --timeout=120s
-
-# Step 3: Destroy Terraform infrastructure
-cd infrastructure/terraform
-make destroy
-# OR: terraform destroy -var-file="environments/prod.tfvars"
-
-# Step 4: (Optional) Remove Terraform state backend
-# Only if you want to fully clean up the AWS account
-aws s3 rb s3://ai-travel-terraform-state-${ACCOUNT_ID} --force
-aws dynamodb delete-table --table-name ai-travel-terraform-locks --region ap-south-1
+kubectl get httproutes -n prod
+# All routes should show: ResolvedRefs=True
 ```
+
+Get the NLB DNS name and verify it matches Route 53:
+
+```bash
+kubectl get gateway api-gateway -n kgateway-system \
+  -o jsonpath='{.status.addresses[0].value}'
+```
+
+### 6. Secrets Setup
+
+All secrets are managed in AWS Secrets Manager. Application pods retrieve their secrets at startup via IRSA.
+
+Terraform creates the secrets with placeholder values. Set real values after provisioning:
+
+```bash
+# Example: user-service secret
+aws secretsmanager put-secret-value \
+  --secret-id ai-travel-prod/user-service \
+  --secret-string '{
+    "DATABASE_URL": "postgresql://user:password@<rds-endpoint>:5432/user_db",
+    "COGNITO_CLIENT_ID": "<client-id>",
+    "COGNITO_CLIENT_SECRET": "<client-secret>",
+    "COGNITO_USER_POOL_ID": "<pool-id>"
+  }'
+
+# Repeat for travel-service, ai-service, utility-service, frontend
+```
+
+Never put secrets in Helm values files, ConfigMaps, or Docker images.
+
+### 7. Platform Validation
+
+After all components are running, validate the full stack:
+
+```bash
+# All pods in prod namespace should be Running
+kubectl get pods -n prod
+
+# All ArgoCD applications should show Synced + Healthy
+kubectl get applications -n argocd
+
+# KEDA ScaledObjects should show READY=True
+kubectl get scaledobjects -n prod
+
+# Karpenter NodePool should show Ready
+kubectl get nodepools
+
+# Test public endpoints
+curl -I https://invest-iq.online
+curl -I https://api.invest-iq.online/health
+```
+
+---
+
+## Standard Release Process
+
+### Dev Deployment (Automatic)
+
+Every push to `main` in `PlanMyJourney-App` triggers the CI pipeline automatically:
+
+```
+Push to main in PlanMyJourney-App
+        │
+        ▼
+GitHub Actions workflow:
+  ├── Run unit tests
+  ├── SAST scan (SonarCloud)
+  ├── Container scan (Trivy)
+  ├── Build Docker image (tag: git SHA)
+  ├── Push to ECR
+  └── Update image.tag in PlanMyJourney-Gitops → values-dev.yaml
+        │
+        ▼
+ArgoCD detects diff in values-dev.yaml
+        │
+        ▼
+ArgoCD syncs → dev namespace updated (rolling update, no downtime)
+```
+
+No human action is required for dev deployments.
+
+### Prod Promotion (Manual GitOps)
+
+Prod is not automatically deployed — a human must approve the promotion by updating `values-prod.yaml` in `PlanMyJourney-Gitops`.
+
+**Option A — Manual GitOps commit:**
+
+```bash
+# In PlanMyJourney-Gitops:
+# Edit helm-charts/<service>/values-prod.yaml
+# Change image.tag from old SHA to new SHA
+
+git add helm-charts/<service>/values-prod.yaml
+git commit -m "chore: promote <service> to <sha> in prod"
+git push origin main
+
+# ArgoCD detects the change and syncs within 3 minutes
+```
+
+**Option B — Workflow dispatch:**
+
+```bash
+gh workflow run promote-to-prod.yml \
+  -f service=ai-service \
+  -f image_tag=20cbe9b710d42565845c4673b8238a4ebc1b9a1e
+```
+
+**Verify promotion:**
+
+```bash
+# Watch ArgoCD sync
+kubectl get application -n argocd <service>-prod --watch
+
+# Confirm new pods are running the promoted image
+kubectl get pods -n prod -l app.kubernetes.io/name=<service>
+
+# Confirm rollout completed cleanly
+kubectl rollout status deployment/<service> -n prod
+```
+
+---
+
+## Environment Configuration
+
+Each service has two Helm values files in `PlanMyJourney-Gitops/helm-charts/<service>/`:
+
+| File | Purpose |
+|---|---|
+| `values-dev.yaml` | Dev-specific overrides — updated by CI (image tag, log level) |
+| `values-prod.yaml` | Prod-specific overrides — updated by humans (or prod-promote workflow) |
+
+**Key differences between environments:**
+
+| Setting | Prod | Dev |
+|---|---|---|
+| `configMap.data.LOG_LEVEL` | `warning` | `debug` |
+| `configMap.data.ENVIRONMENT` | `production` | `development` |
+| `replicaCount` | 2 (minimum) | 1 |
+| `resources.requests.cpu` | 500m | 250m |
+| `podDisruptionBudget.enabled` | `true` | `false` |
+| `configMap.data.BEDROCK_MAX_TOKENS` | `4096` | `2048` |
+
+All environment-specific values live in `values-*.yaml` files, never in the base Helm chart templates.
+
+---
+
+## Rollback Procedure
+
+### Application Rollback (< 2 minutes)
+
+Rolling back an application is a GitOps operation — revert the image tag in `values-prod.yaml`:
+
+```bash
+# In PlanMyJourney-Gitops:
+git log --oneline helm-charts/<service>/values-prod.yaml   # find previous good tag
+git revert HEAD                                             # or manually edit the tag
+git push origin main
+
+# ArgoCD syncs and Kubernetes performs a rolling update to the previous image
+```
+
+Kubernetes keeps the previous ReplicaSet ready so the rollback transition is seamless.
+
+### Infrastructure Rollback (Terraform)
+
+```bash
+# Review Terraform state history in S3
+aws s3api list-object-versions \
+  --bucket ai-travel-prod-terraform-state \
+  --prefix terraform.tfstate
+
+# Restore a specific version, then re-plan and apply
+terraform plan
+terraform apply
+```
+
+### Database Rollback
+
+RDS Multi-AZ failover is fully automatic and requires no manual steps. If a schema migration must be reverted:
+
+```bash
+# Run Alembic downgrade inside the service pod
+kubectl exec -it deploy/<service> -n prod -- alembic downgrade -1
+```
+
+---
+
+## Disaster Recovery Deployment
+
+If the entire cluster is lost (catastrophic failure), the following steps restore full service from Git and AWS backups. Expected total recovery time is under 30 minutes.
+
+```bash
+# 1. Re-apply Terraform (re-creates VPC, EKS, RDS, SQS, IAM roles)
+cd PlanMyjourney-Terraform
+terraform apply
+
+# 2. Update kubeconfig for the new cluster
+aws eks update-kubeconfig --region us-east-1 --name ai-travel-prod
+
+# 3. Bootstrap ArgoCD
+kubectl create namespace argocd
+helm install argocd argo/argo-cd --namespace argocd \
+  --values PlanMyJourney-Gitops/platform/argocd/values.yaml
+kubectl rollout status deployment/argocd-server -n argocd --timeout=300s
+
+# 4. Apply root Application — ArgoCD installs everything from GitOps repo
+kubectl apply -f PlanMyJourney-Gitops/argocd-apps/root-app.yaml
+
+# 5. Monitor recovery — all apps should reach Synced + Healthy
+kubectl get applications -n argocd --watch
+
+# 6. If RDS was also lost, restore from snapshot
+aws rds restore-db-instance-from-db-snapshot \
+  --db-instance-identifier ai-travel-prod-postgres \
+  --db-snapshot-identifier <most-recent-snapshot-id> \
+  --db-subnet-group-name ai-travel-prod-db-subnet \
+  --vpc-security-group-ids <rds-sg-id> \
+  --multi-az
+```
+
+**Expected recovery timeline:**
+
+| Phase | Duration |
+|---|---|
+| Terraform apply (new cluster) | 12–15 minutes |
+| ArgoCD ready | 3–5 minutes |
+| All services synced and Running | 5–7 minutes |
+| **Total (cluster loss)** | **< 30 minutes** |
+| **RDS-only failure** | **< 2 minutes (automatic)** |
+
+For RDS-only failure, Multi-AZ failover is fully automatic with no manual steps required.
+
+See [ARCHITECTURE.md — Disaster Recovery Architecture](ARCHITECTURE.md#disaster-recovery-architecture) for the full failure scenario matrix and RTO/RPO targets.
